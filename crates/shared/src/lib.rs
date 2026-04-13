@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct MonitorSnapshot {
     pub id: String,
     pub backend: String,
+    pub device_path: Option<String>,
+    pub connector_name: Option<String>,
     pub manufacturer_id: Option<String>,
     pub model_name: Option<String>,
     pub serial_number: Option<String>,

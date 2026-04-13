@@ -29,6 +29,8 @@ mod imp {
         id: String,
         display_number: u8,
         bus_number: Option<u8>,
+        device_path: Option<String>,
+        connector_name: Option<String>,
         manufacturer_id: Option<String>,
         model_name: Option<String>,
         serial_number: Option<String>,
@@ -254,6 +256,8 @@ mod imp {
         MonitorSnapshot {
             id: monitor.id.clone(),
             backend: String::from("ddcutil"),
+            device_path: monitor.device_path.clone(),
+            connector_name: monitor.connector_name.clone(),
             manufacturer_id: monitor.manufacturer_id.clone(),
             model_name: monitor.model_name.clone(),
             serial_number: monitor.serial_number.clone(),
@@ -461,6 +465,8 @@ mod imp {
                     id: display_number.to_string(),
                     display_number,
                     bus_number: None,
+                    device_path: None,
+                    connector_name: None,
                     manufacturer_id: None,
                     model_name: None,
                     serial_number: None,
@@ -474,12 +480,21 @@ mod imp {
 
             if let Some(path) = line.strip_prefix("I2C bus:") {
                 let path = path.trim();
+                monitor.device_path = Some(path.to_string());
                 monitor.bus_number = path
                     .rsplit('-')
                     .next()
                     .and_then(|number| number.parse::<u8>().ok());
                 if let Some(bus_number) = monitor.bus_number {
                     monitor.id = bus_number.to_string();
+                }
+                continue;
+            }
+
+            if let Some(value) = line.strip_prefix("DRM_connector:") {
+                let connector = value.trim();
+                if !connector.is_empty() {
+                    monitor.connector_name = Some(connector.to_string());
                 }
                 continue;
             }
@@ -672,11 +687,14 @@ Display 2
             assert_eq!(monitors.len(), 2);
             assert_eq!(monitors[0].display_number, 1);
             assert_eq!(monitors[0].bus_number, Some(7));
+            assert_eq!(monitors[0].device_path.as_deref(), Some("/dev/i2c-7"));
             assert_eq!(monitors[0].manufacturer_id.as_deref(), Some("SAM"));
             assert_eq!(monitors[0].model_name.as_deref(), Some("C49J89x"));
             assert_eq!(monitors[0].serial_number.as_deref(), Some("HTJKC00543"));
             assert_eq!(monitors[1].display_number, 2);
             assert_eq!(monitors[1].bus_number, Some(9));
+            assert_eq!(monitors[1].device_path.as_deref(), Some("/dev/i2c-9"));
+            assert_eq!(monitors[1].connector_name.as_deref(), Some("card2-DP-3"));
             assert_eq!(monitors[1].manufacturer_id.as_deref(), Some("SAM"));
             assert_eq!(monitors[1].model_name.as_deref(), Some("C34H89x"));
             assert_eq!(monitors[1].serial_number.as_deref(), Some("H4ZRC04847"));
@@ -815,6 +833,8 @@ mod imp {
         MonitorSnapshot {
             id: display.info.id.clone(),
             backend: format!("{:?}", display.info.backend),
+            device_path: None,
+            connector_name: None,
             manufacturer_id: display.info.manufacturer_id.clone(),
             model_name: display.info.model_name.clone(),
             serial_number: display.info.serial_number.clone(),

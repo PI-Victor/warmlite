@@ -2,7 +2,7 @@ use leptos::ev::Event;
 use leptos::prelude::*;
 use shared::{ControlOption, MonitorControl, MonitorSnapshot};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlInputElement;
+use web_sys::{window, HtmlDetailsElement, HtmlInputElement};
 
 use crate::interop;
 
@@ -23,6 +23,48 @@ struct RangeChangeContext {
 struct ColorSceneOption {
     id: &'static str,
     label: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceFoldState {
+    manual_gains: RwSignal<bool>,
+    warm_scene: RwSignal<bool>,
+    input_source: RwSignal<bool>,
+    display_mode: RwSignal<bool>,
+    audio: RwSignal<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    fn next(self) -> Self {
+        match self {
+            Self::System => Self::Dark,
+            Self::Dark => Self::Light,
+            Self::Light => Self::System,
+        }
+    }
+
+    fn attr(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "Theme: System",
+            Self::Dark => "Theme: Dark",
+            Self::Light => "Theme: Light",
+        }
+    }
 }
 
 const COLOR_SCENES: &[ColorSceneOption] = &[
@@ -59,6 +101,14 @@ pub fn App() -> impl IntoView {
     let status = RwSignal::new(String::from("Scanning displays..."));
     let is_loading = RwSignal::new(false);
     let glide_delay_ms = RwSignal::new(18_u16);
+    let theme_mode = RwSignal::new(ThemeMode::System);
+    let surface_folds = SurfaceFoldState {
+        manual_gains: RwSignal::new(false),
+        warm_scene: RwSignal::new(false),
+        input_source: RwSignal::new(false),
+        display_mode: RwSignal::new(false),
+        audio: RwSignal::new(false),
+    };
 
     let refresh = move || {
         is_loading.set(true);
@@ -100,6 +150,19 @@ pub fn App() -> impl IntoView {
         refresh();
     });
 
+    Effect::new(move |_| {
+        if let Some(window) = window() {
+            if let Some(document) = window.document() {
+                if let Some(root) = document.document_element() {
+                    let _ = root.set_attribute(
+                        "data-theme",
+                        theme_mode.get().attr(),
+                    );
+                }
+            }
+        }
+    });
+
     view! {
         <main class="shell scene-shell">
             <header class="scene-topbar">
@@ -111,6 +174,14 @@ pub fn App() -> impl IntoView {
                 </div>
 
                 <div class="topbar-tools">
+                    <button
+                        class="button ghost toolbar-button"
+                        type="button"
+                        on:click=move |_| theme_mode.update(|mode| *mode = mode.next())
+                    >
+                        {move || theme_mode.get().label()}
+                    </button>
+
                     <div class="glide-inline">
                         <span class="panel-label">"Glide"</span>
                         <input
@@ -120,6 +191,10 @@ pub fn App() -> impl IntoView {
                             max="50"
                             step="2"
                             prop:value=move || glide_delay_ms.get().to_string()
+                            style=move || format!(
+                                "--slider-fill: {}%;",
+                                ((glide_delay_ms.get() as f32 / 50.0) * 100.0).round() as u16
+                            )
                             on:input=move |event: Event| {
                                 let input = event_target::<HtmlInputElement>(&event);
                                 if let Ok(parsed) = input.value().parse::<u16>() {
@@ -147,11 +222,6 @@ pub fn App() -> impl IntoView {
             </div>
 
             <section class="display-switcher-bar">
-                <div class="dock-label top">
-                    <span>"Displays"</span>
-                    <strong>{move || monitors.get().len()}</strong>
-                </div>
-
                 <div class="display-switcher">
                     <For
                         each=move || monitors.get()
@@ -161,11 +231,7 @@ pub fn App() -> impl IntoView {
                             let monitor_id_for_class = monitor_id.clone();
                             let monitor_id_for_click = monitor_id.clone();
                             let monitor_name = monitor.label();
-                            let meta = monitor
-                                .serial_number
-                                .clone()
-                                .or_else(|| monitor.manufacturer_id.clone())
-                                .unwrap_or_else(|| monitor.backend.clone());
+                            let meta = display_switch_meta(&monitor);
 
                             view! {
                                 <button
@@ -195,13 +261,27 @@ pub fn App() -> impl IntoView {
                                 monitor
                                 monitors
                                 glide_delay_ms
+                                surface_folds
                             />
                         }
                         .into_any()
                     } else {
                         view! {
                             <div class="empty-scene">
-                                <p class="screen-kicker">"No display selected"</p>
+                                <div class="empty-display-search" aria-hidden="true">
+                                    <span class="search-wave wave-left near"></span>
+                                    <span class="search-wave wave-left far"></span>
+                                    <div class="empty-display">
+                                        <div class="empty-display-frame">
+                                            <span class="empty-display-glow"></span>
+                                            <span class="empty-display-scan"></span>
+                                        </div>
+                                        <div class="empty-display-neck"></div>
+                                        <div class="empty-display-base"></div>
+                                    </div>
+                                    <span class="search-wave wave-right near"></span>
+                                    <span class="search-wave wave-right far"></span>
+                                </div>
                                 <h2>"Waiting for a monitor"</h2>
                                 <p>"Refresh after connecting a DDC-capable display."</p>
                             </div>
@@ -220,10 +300,11 @@ fn MonitorStage(
     monitor: MonitorSnapshot,
     monitors: RwSignal<Vec<MonitorSnapshot>>,
     glide_delay_ms: RwSignal<u16>,
+    surface_folds: SurfaceFoldState,
 ) -> impl IntoView {
     let local_error = RwSignal::new(String::new());
     let is_busy = RwSignal::new(false);
-    let identity_label = format!("{}  •  {}", monitor.backend, monitor.id);
+    let identity_label = monitor_identity_label(&monitor);
     let monitor_error = monitor.error.clone();
     let monitor_error_when = monitor_error.clone();
     let title = monitor.label();
@@ -285,7 +366,7 @@ fn MonitorStage(
         <div class="studio-plane">
             <header class="studio-header">
                 <div class="studio-heading">
-                    <p class="screen-kicker">{identity_label}</p>
+                    <p class="screen-route">{identity_label}</p>
                     <h2 class="screen-title">{title.clone()}</h2>
                     <p class="screen-subtitle">{subtitle.clone()}</p>
                 </div>
@@ -320,9 +401,6 @@ fn MonitorStage(
 
                 <section class="display-plane">
                     <div class="display-frame">
-                        <div class="frame-accent top"></div>
-                        <div class="frame-accent side"></div>
-
                         <div class="frame-head">
                             <div class="frame-copy">
                                 <p class="monitor-kicker">"Signal surface"</p>
@@ -378,37 +456,6 @@ fn MonitorStage(
                                 </div>
                             </Show>
 
-                            <Show when=move || !gain_controls.is_empty()>
-                                <div class="surface-inline surface-gains-inline">
-                                    <div class="flat-section-head">
-                                        <div>
-                                            <p class="panel-label">"Manual Gains"</p>
-                                            <strong class="panel-value">"Red, green, and blue channel trims"</strong>
-                                        </div>
-                                    </div>
-
-                                    <div class="surface-gain-grid">
-                                        <For
-                                            each=move || gain_controls_for_each.get_value()
-                                            key=|control| control.code.clone()
-                                            children=move |control| {
-                                                view! {
-                                                    <RangeControl
-                                                        monitor_id=monitor_id_surface_controls.get_value()
-                                                        monitors
-                                                        control
-                                                        glide_delay_ms
-                                                        is_busy
-                                                        local_error
-                                                        variant="inline"
-                                                    />
-                                                }
-                                            }
-                                        />
-                                    </div>
-                                </div>
-                            </Show>
-
                             <Show when=move || has_color_scenes>
                                 <div class="surface-inline">
                                     <WarmSceneControl
@@ -416,7 +463,51 @@ fn MonitorStage(
                                         monitors
                                         is_busy
                                         local_error
+                                        is_open=surface_folds.warm_scene
                                     />
+                                </div>
+                            </Show>
+
+                            <Show when=move || !gain_controls.is_empty()>
+                                <div class="surface-inline surface-gains-inline">
+                                    <details
+                                        class="surface-fold"
+                                        prop:open=move || surface_folds.manual_gains.get()
+                                        on:toggle=move |event: Event| {
+                                            surface_folds
+                                                .manual_gains
+                                                .set(event_target::<HtmlDetailsElement>(&event).open());
+                                        }
+                                    >
+                                        <summary class="surface-fold-summary">
+                                            <div>
+                                                <p class="panel-label">"Manual Gains"</p>
+                                                <strong class="panel-value surface-fold-value">
+                                                    "Red, green, and blue channel trims"
+                                                </strong>
+                                            </div>
+                                        </summary>
+
+                                        <div class="surface-fold-body surface-gain-grid">
+                                            <For
+                                                each=move || gain_controls_for_each.get_value()
+                                                key=|control| control.code.clone()
+                                                children=move |control| {
+                                                    view! {
+                                                        <RangeControl
+                                                            monitor_id=monitor_id_surface_controls.get_value()
+                                                            monitors
+                                                            control
+                                                            glide_delay_ms
+                                                            is_busy
+                                                            local_error
+                                                            variant="inline"
+                                                        />
+                                                    }
+                                                }
+                                            />
+                                        </div>
+                                    </details>
                                 </div>
                             </Show>
 
@@ -438,6 +529,7 @@ fn MonitorStage(
                                                     is_busy
                                                     local_error
                                                     variant="surface"
+                                                    open_state=Some(surface_folds.input_source)
                                                 />
                                             </div>
                                         </Show>
@@ -451,12 +543,13 @@ fn MonitorStage(
                                                     is_busy
                                                     local_error
                                                     variant="surface"
+                                                    open_state=Some(surface_folds.display_mode)
                                                 />
                                             </div>
                                         </Show>
 
                                         <Show when=move || has_audio_controls>
-                                            <div class="surface-inline surface-inline-narrow surface-span-full">
+                                            <div class="surface-inline surface-inline-narrow">
                                                 <AudioControlSection
                                                     monitor_id=monitor_id_audio_for_view.get_value()
                                                     monitors
@@ -465,6 +558,7 @@ fn MonitorStage(
                                                     glide_delay_ms
                                                     is_busy
                                                     local_error
+                                                    is_open=surface_folds.audio
                                                 />
                                             </div>
                                         </Show>
@@ -579,6 +673,7 @@ fn PresetSceneControl(
                             children=move |option| {
                                 let option_value = option.value;
                                 let option_label = option.label.clone();
+                                let tone_class = preset_tone_class(&option_label).to_string();
                                 let monitor_id = monitor_id_for_presets.get_value();
                                 let control_code = preset_code_for_action.get_value();
                                 let control_label = preset_label_for_action.get_value();
@@ -587,9 +682,9 @@ fn PresetSceneControl(
                                     <button
                                         class=move || {
                                             if preset_selected_value.get() == option_value {
-                                                "choice-segment active"
+                                                format!("choice-segment preset-segment {tone_class} active")
                                             } else {
-                                                "choice-segment"
+                                                format!("choice-segment preset-segment {tone_class}")
                                             }
                                         }
                                         type="button"
@@ -617,7 +712,8 @@ fn PresetSceneControl(
                                             });
                                         }
                                     >
-                                        {option_label}
+                                        <span class=format!("preset-swatch {tone_class}")></span>
+                                        <span>{option_label}</span>
                                     </button>
                                 }
                             }
@@ -646,62 +742,73 @@ fn WarmSceneControl(
     monitors: RwSignal<Vec<MonitorSnapshot>>,
     is_busy: RwSignal<bool>,
     local_error: RwSignal<String>,
+    is_open: RwSignal<bool>,
 ) -> impl IntoView {
     let active_scene = RwSignal::new(None::<String>);
     let monitor_id_for_scenes = StoredValue::new(monitor_id);
 
     view! {
-        <section class="preset-section">
-            <div class="flat-section-head">
+        <details
+            class="surface-fold"
+            prop:open=move || is_open.get()
+            on:toggle=move |event: Event| {
+                is_open.set(event_target::<HtmlDetailsElement>(&event).open());
+            }
+        >
+            <summary class="surface-fold-summary">
                 <div>
                     <p class="panel-label">"Warm Scene"</p>
-                    <strong class="panel-value">
+                    <strong class="panel-value surface-fold-value">
                         {move || active_scene.get().unwrap_or_else(|| String::from("Manual gains"))}
                     </strong>
                 </div>
-            </div>
+            </summary>
 
-            <div class="choice-strip preset-choice-strip" role="group" aria-label="Warm Scene">
-                <For
-                    each=move || COLOR_SCENES.iter().copied()
-                    key=|scene| scene.id
-                    children=move |scene| {
-                        let monitor_id = monitor_id_for_scenes.get_value();
+            <div class="surface-fold-body">
+                <div class="choice-strip preset-choice-strip" role="group" aria-label="Warm Scene">
+                    <For
+                        each=move || COLOR_SCENES.iter().copied()
+                        key=|scene| scene.id
+                        children=move |scene| {
+                            let monitor_id = monitor_id_for_scenes.get_value();
+                            let tone_class = warm_scene_tone_class(scene.id).to_string();
 
-                        view! {
-                            <button
-                                class=move || {
-                                    if active_scene.get().as_deref() == Some(scene.id) {
-                                        "choice-segment active"
-                                    } else {
-                                        "choice-segment"
-                                    }
-                                }
-                                type="button"
-                                disabled=move || is_busy.get()
-                                on:click=move |_| {
-                                    is_busy.set(true);
-                                    local_error.set(String::new());
-                                    active_scene.set(Some(scene.label.to_string()));
-
-                                    let monitor_id = monitor_id.clone();
-                                    spawn_local(async move {
-                                        match interop::apply_color_scene(&monitor_id, scene.id).await {
-                                            Ok(updated) => replace_monitor_snapshot(monitors, updated),
-                                            Err(error) => local_error.set(format!("Custom Scene: {error}")),
+                            view! {
+                                <button
+                                    class=move || {
+                                        if active_scene.get().as_deref() == Some(scene.id) {
+                                            format!("choice-segment preset-segment {tone_class} active")
+                                        } else {
+                                            format!("choice-segment preset-segment {tone_class}")
                                         }
+                                    }
+                                    type="button"
+                                    disabled=move || is_busy.get()
+                                    on:click=move |_| {
+                                        is_busy.set(true);
+                                        local_error.set(String::new());
+                                        active_scene.set(Some(scene.label.to_string()));
 
-                                        is_busy.set(false);
-                                    });
-                                }
-                            >
-                                {scene.label}
-                            </button>
+                                        let monitor_id = monitor_id.clone();
+                                        spawn_local(async move {
+                                            match interop::apply_color_scene(&monitor_id, scene.id).await {
+                                                Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                                Err(error) => local_error.set(format!("Custom Scene: {error}")),
+                                            }
+
+                                            is_busy.set(false);
+                                        });
+                                    }
+                                >
+                                    <span class=format!("preset-swatch {tone_class}")></span>
+                                    <span>{scene.label}</span>
+                                </button>
+                            }
                         }
-                    }
-                />
+                    />
+                </div>
             </div>
-        </section>
+        </details>
     }
 }
 
@@ -714,6 +821,7 @@ fn AudioControlSection(
     glide_delay_ms: RwSignal<u16>,
     is_busy: RwSignal<bool>,
     local_error: RwSignal<String>,
+    is_open: RwSignal<bool>,
 ) -> impl IntoView {
     let has_mute_control = mute_control.is_some();
     let mute_options = mute_control
@@ -753,11 +861,17 @@ fn AudioControlSection(
     let mute_control_label_for_actions = StoredValue::new(mute_control_label.clone());
 
     view! {
-        <section class="preset-section audio-section">
-            <div class="flat-section-head">
+        <details
+            class="surface-fold audio-section"
+            prop:open=move || is_open.get()
+            on:toggle=move |event: Event| {
+                is_open.set(event_target::<HtmlDetailsElement>(&event).open());
+            }
+        >
+            <summary class="surface-fold-summary">
                 <div>
                     <p class="panel-label">"Audio"</p>
-                    <strong class="panel-value">
+                    <strong class="panel-value surface-fold-value">
                         {move || {
                             if let Some(summary) = mute_summary.clone() {
                                 summary
@@ -769,80 +883,82 @@ fn AudioControlSection(
                         }}
                     </strong>
                 </div>
-            </div>
+            </summary>
 
-            <Show when=move || !mute_options_for_each.get_value().is_empty()>
-                <div class="choice-strip preset-choice-strip" role="group" aria-label="Audio mute">
-                    <For
-                        each=move || mute_options_for_each.get_value()
-                        key=|option| option.value
-                        children=move |option| {
-                            let option_value = option.value;
-                            let option_label_text = option.label.clone();
-                            let monitor_id = monitor_id_for_mute.get_value();
-                            let control_code = mute_control_code_for_actions.get_value();
-                            let control_label = mute_control_label_for_actions.get_value();
+            <div class="surface-fold-body">
+                <Show when=move || !mute_options_for_each.get_value().is_empty()>
+                    <div class="choice-strip preset-choice-strip" role="group" aria-label="Audio mute">
+                        <For
+                            each=move || mute_options_for_each.get_value()
+                            key=|option| option.value
+                            children=move |option| {
+                                let option_value = option.value;
+                                let option_label_text = option.label.clone();
+                                let monitor_id = monitor_id_for_mute.get_value();
+                                let control_code = mute_control_code_for_actions.get_value();
+                                let control_label = mute_control_label_for_actions.get_value();
 
-                            view! {
-                                <button
-                                    class=move || {
-                                        if mute_selected_value.get() == option_value {
-                                            "choice-segment active"
-                                        } else {
-                                            "choice-segment"
+                                view! {
+                                    <button
+                                        class=move || {
+                                            if mute_selected_value.get() == option_value {
+                                                "choice-segment active"
+                                            } else {
+                                                "choice-segment"
+                                            }
                                         }
-                                    }
-                                    type="button"
-                                    disabled=move || !mute_supported || is_busy.get()
-                                    on:click=move |_| {
-                                        if mute_selected_value.get_untracked() == option_value {
-                                            return;
-                                        }
-
-                                        mute_selected_value.set(option_value);
-                                        is_busy.set(true);
-                                        local_error.set(String::new());
-
-                                        let monitor_id = monitor_id.clone();
-                                        let control_code = control_code.clone();
-                                        let control_label = control_label.clone();
-
-                                        spawn_local(async move {
-                                            match interop::set_feature(&monitor_id, &control_code, option_value).await {
-                                                Ok(updated) => replace_monitor_snapshot(monitors, updated),
-                                                Err(error) => local_error.set(format!("{control_label}: {error}")),
+                                        type="button"
+                                        disabled=move || !mute_supported || is_busy.get()
+                                        on:click=move |_| {
+                                            if mute_selected_value.get_untracked() == option_value {
+                                                return;
                                             }
 
-                                            is_busy.set(false);
-                                        });
-                                    }
-                                >
-                                    {option_label_text}
-                                </button>
+                                            mute_selected_value.set(option_value);
+                                            is_busy.set(true);
+                                            local_error.set(String::new());
+
+                                            let monitor_id = monitor_id.clone();
+                                            let control_code = control_code.clone();
+                                            let control_label = control_label.clone();
+
+                                            spawn_local(async move {
+                                                match interop::set_feature(&monitor_id, &control_code, option_value).await {
+                                                    Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                                    Err(error) => local_error.set(format!("{control_label}: {error}")),
+                                                }
+
+                                                is_busy.set(false);
+                                            });
+                                        }
+                                    >
+                                        {option_label_text}
+                                    </button>
+                                }
                             }
-                        }
+                        />
+                    </div>
+                </Show>
+
+                <Show when=move || volume_control_for_view.get_value().is_some()>
+                    <RangeControl
+                        monitor_id=monitor_id.clone()
+                        monitors
+                        control=volume_control_for_view.get_value().unwrap()
+                        glide_delay_ms
+                        is_busy
+                        local_error
+                        variant="row"
                     />
-                </div>
-            </Show>
+                </Show>
 
-            <Show when=move || volume_control_for_view.get_value().is_some()>
-                <RangeControl
-                    monitor_id=monitor_id.clone()
-                    monitors
-                    control=volume_control_for_view.get_value().unwrap()
-                    glide_delay_ms
-                    is_busy
-                    local_error
-                    variant="row"
-                />
-            </Show>
-
-            <Show when=move || has_mute_control && !mute_supported>
-                <p class="support-note warning">
-                    {mute_error.clone().unwrap_or_else(|| format!("{mute_control_label} is unavailable."))}
-                </p>
-            </Show>
-        </section>
+                <Show when=move || has_mute_control && !mute_supported>
+                    <p class="support-note warning">
+                        {mute_error.clone().unwrap_or_else(|| format!("{mute_control_label} is unavailable."))}
+                    </p>
+                </Show>
+            </div>
+        </details>
     }
 }
 
@@ -1145,6 +1261,7 @@ fn ChoiceControl(
     is_busy: RwSignal<bool>,
     local_error: RwSignal<String>,
     variant: &'static str,
+    open_state: Option<RwSignal<bool>>,
 ) -> impl IntoView {
     let selected_value = RwSignal::new(control.current_value.unwrap_or_default());
     let control_code = control.code.clone();
@@ -1212,29 +1329,38 @@ fn ChoiceControl(
     };
 
     if variant == "surface" {
+        let is_open = open_state.unwrap_or(RwSignal::new(false));
         view! {
-            <section class="preset-section">
-                <div class="flat-section-head">
-                        <div>
-                            <p class="panel-label">{control_heading_label.clone()}</p>
-                            <strong class="panel-value">
-                                {move || option_label(&options_for_value, selected_value.get())}
-                            </strong>
+            <details
+                class="surface-fold"
+                prop:open=move || is_open.get()
+                on:toggle=move |event: Event| {
+                    is_open.set(event_target::<HtmlDetailsElement>(&event).open());
+                }
+            >
+                <summary class="surface-fold-summary">
+                    <div>
+                        <p class="panel-label">{control_heading_label.clone()}</p>
+                        <strong class="panel-value surface-fold-value">
+                            {move || option_label(&options_for_value, selected_value.get())}
+                        </strong>
                     </div>
+                </summary>
+
+                <div class="surface-fold-body">
+                    {choice_body()}
+
+                    <Show when=move || !control_supported || !has_options>
+                        <p class="support-note warning">
+                            {if !control_supported {
+                                control_error.clone().unwrap_or_else(|| format!("{} is unavailable.", control.label))
+                            } else {
+                                format!("{} does not expose selectable values.", control.label)
+                            }}
+                        </p>
+                    </Show>
                 </div>
-
-                {choice_body()}
-
-                <Show when=move || !control_supported || !has_options>
-                    <p class="support-note warning">
-                        {if !control_supported {
-                            control_error.clone().unwrap_or_else(|| format!("{} is unavailable.", control.label))
-                        } else {
-                            format!("{} does not expose selectable values.", control.label)
-                        }}
-                    </p>
-                </Show>
-            </section>
+            </details>
         }
             .into_any()
     } else {
@@ -1430,6 +1556,33 @@ fn glide_compact_label(delay_ms: u16) -> String {
     }
 }
 
+fn preset_tone_class(label: &str) -> &'static str {
+    let lower = label.to_ascii_lowercase();
+
+    if lower.contains("srgb") || lower.contains("graphics") || lower.contains("photo") {
+        "tone-paper"
+    } else if lower.contains("5000") || lower.contains("reading") || lower.contains("print") {
+        "tone-daylight"
+    } else if lower.contains("6500") || lower.contains("web") || lower.contains("gaming") {
+        "tone-crisp"
+    } else if lower.contains("7500") || lower.contains("8200") || lower.contains("cool") {
+        "tone-cool"
+    } else if lower.contains("9300") || lower.contains("11500") || lower.contains("blue") || lower.contains("ice") {
+        "tone-blue"
+    } else {
+        "tone-custom"
+    }
+}
+
+fn warm_scene_tone_class(scene_id: &str) -> &'static str {
+    match scene_id {
+        "paper" => "tone-paper",
+        "sunset" | "ember" | "incandescent" | "candle" => "tone-custom",
+        "nocturne" => "tone-blue",
+        _ => "tone-custom",
+    }
+}
+
 fn slider_display(current: u16, maximum: Option<u16>) -> String {
     match maximum {
         Some(maximum) if maximum > 0 => {
@@ -1518,6 +1671,29 @@ fn monitor_subtitle(monitor: &MonitorSnapshot) -> String {
         (None, Some(serial)) => serial.clone(),
         (None, None) => String::new(),
     }
+}
+
+fn monitor_identity_label(monitor: &MonitorSnapshot) -> String {
+    if let Some(device) = monitor_transport_label(monitor) {
+        if let Some(connector) = monitor.connector_name.as_ref() {
+            return format!("{device}  •  {connector}");
+        }
+
+        return device;
+    }
+
+    format!("{}  •  {}", monitor.backend, monitor.id)
+}
+
+fn display_switch_meta(monitor: &MonitorSnapshot) -> String {
+    monitor_transport_label(monitor)
+        .or_else(|| monitor.serial_number.clone())
+        .or_else(|| monitor.manufacturer_id.clone())
+        .unwrap_or_else(|| monitor.backend.clone())
+}
+
+fn monitor_transport_label(monitor: &MonitorSnapshot) -> Option<String> {
+    monitor.device_path.as_ref().map(|path| format!("dev:{path}"))
 }
 
 fn queue_range_change(ctx: RangeChangeContext, parsed: u16) {

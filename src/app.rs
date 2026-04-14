@@ -273,8 +273,6 @@ pub fn App() -> impl IntoView {
                         view! {
                             <div class="empty-scene">
                                 <div class="empty-display-search" aria-hidden="true">
-                                    <span class="search-wave wave-left near"></span>
-                                    <span class="search-wave wave-left far"></span>
                                     <div class="empty-display">
                                         <div class="empty-display-frame">
                                             <span class="empty-display-glow"></span>
@@ -283,8 +281,6 @@ pub fn App() -> impl IntoView {
                                         <div class="empty-display-neck"></div>
                                         <div class="empty-display-base"></div>
                                     </div>
-                                    <span class="search-wave wave-right near"></span>
-                                    <span class="search-wave wave-right far"></span>
                                 </div>
                                 <h2>"Waiting for a monitor"</h2>
                                 <p>"Refresh after connecting a DDC-capable display."</p>
@@ -1166,7 +1162,20 @@ fn ActionControlSection(
     local_error: RwSignal<String>,
     is_open: RwSignal<bool>,
 ) -> impl IntoView {
-    let controls_for_view = StoredValue::new(controls);
+    let primary_controls: Vec<_> = controls
+        .iter()
+        .filter(|control| matches!(control.code.as_str(), "04" | "05" | "08"))
+        .cloned()
+        .collect();
+    let secondary_controls: Vec<_> = controls
+        .iter()
+        .filter(|control| !matches!(control.code.as_str(), "04" | "05" | "08"))
+        .cloned()
+        .collect();
+    let primary_controls_for_view = StoredValue::new(primary_controls);
+    let secondary_controls_for_view = StoredValue::new(secondary_controls);
+    let monitor_id_for_primary = StoredValue::new(monitor_id.clone());
+    let monitor_id_for_secondary = StoredValue::new(monitor_id);
 
     view! {
         <details
@@ -1186,13 +1195,35 @@ fn ActionControlSection(
             </summary>
 
             <div class="surface-fold-body action-list surface-action-list">
+                <Show when=move || !primary_controls_for_view.get_value().is_empty()>
+                    <div class="action-row surface-action-strip">
+                        <div class="choice-strip preset-choice-strip surface-action-inline" role="group" aria-label="Restore defaults">
+                            <For
+                                each=move || primary_controls_for_view.get_value()
+                                key=|control| control.code.clone()
+                                children=move |control| {
+                                    view! {
+                                        <SurfaceActionButton
+                                            monitor_id=monitor_id_for_primary.get_value()
+                                            monitors
+                                            control
+                                            is_busy
+                                            local_error
+                                        />
+                                    }
+                                }
+                            />
+                        </div>
+                    </div>
+                </Show>
+
                 <For
-                    each=move || controls_for_view.get_value()
+                    each=move || secondary_controls_for_view.get_value()
                     key=|control| control.code.clone()
                     children=move |control| {
                         view! {
                             <SurfaceActionRow
-                                monitor_id=monitor_id.clone()
+                                monitor_id=monitor_id_for_secondary.get_value()
                                 monitors
                                 control
                                 is_busy
@@ -1203,6 +1234,59 @@ fn ActionControlSection(
                 />
             </div>
         </details>
+    }
+}
+
+#[component]
+fn SurfaceActionButton(
+    monitor_id: String,
+    monitors: RwSignal<Vec<MonitorSnapshot>>,
+    control: MonitorControl,
+    is_busy: RwSignal<bool>,
+    local_error: RwSignal<String>,
+) -> impl IntoView {
+    let option = control.options.first().cloned();
+    let label = control.label.clone();
+    let label_for_warning = label.clone();
+    let control_code = control.code.clone();
+    let supported = control.supported && option.is_some();
+    let error = control.error.clone();
+
+    view! {
+        <button
+            class="choice-segment"
+            type="button"
+            disabled=move || !supported || is_busy.get()
+            on:click=move |_| {
+                let Some(option) = option.clone() else {
+                    return;
+                };
+
+                is_busy.set(true);
+                local_error.set(String::new());
+
+                let monitor_id = monitor_id.clone();
+                let control_code = control_code.clone();
+                let label = label.clone();
+
+                spawn_local(async move {
+                    match interop::set_feature(&monitor_id, &control_code, option.value).await {
+                        Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                        Err(error) => local_error.set(format!("{label}: {error}")),
+                    }
+
+                    is_busy.set(false);
+                });
+            }
+        >
+            {label.clone()}
+        </button>
+
+        <Show when=move || !supported>
+            <p class="support-note warning">
+                {error.clone().unwrap_or_else(|| format!("{label_for_warning} is unavailable."))}
+            </p>
+        </Show>
     }
 }
 

@@ -106,6 +106,7 @@ html,
 body {
   margin: 0;
   min-height: 100%;
+  font-size: 125%;
   background:
     radial-gradient(circle at top, rgba(148, 187, 200, 0.14), transparent 32%),
     linear-gradient(180deg, var(--bg-1), var(--bg-0));
@@ -121,7 +122,7 @@ body {
 }
 
 .shell {
-  width: min(1240px, calc(100vw - 32px));
+  width: min(1240px, calc(100vw - 56px));
   margin: 0 auto;
   padding: 16px 0 8px;
 }
@@ -330,7 +331,7 @@ body {
 .studio-layout {
   display: grid;
   grid-template-columns: 176px minmax(0, 1fr) 176px;
-  gap: 18px;
+  gap: 23px;
   align-items: start;
 }
 
@@ -491,6 +492,7 @@ body {
 }
 
 .display-plane {
+  width: 100%;
   min-width: 0;
 }
 
@@ -498,7 +500,7 @@ body {
   min-height: 0;
   display: grid;
   grid-template-rows: auto auto auto;
-  gap: 14px;
+  gap: 3px;
   padding: 0;
 }
 
@@ -554,7 +556,7 @@ body {
 }
 
 .surface-secondary-controls {
-  padding-top: 10px;
+  padding-top: 2px;
   border-top: 0;
 }
 
@@ -1438,9 +1440,14 @@ body {
   }
 }
 
-@media (max-width: 1080px) {
+@media (max-width: 560px) {
   .studio-layout {
     grid-template-columns: 1fr;
+  }
+
+  .display-plane {
+    max-width: none;
+    justify-self: stretch;
   }
 
   .surface-secondary-grid {
@@ -1453,9 +1460,9 @@ body {
   }
 }
 
-@media (max-width: 720px) {
+@media (max-width: 420px) {
   .shell {
-    width: min(100vw - 18px, 1240px);
+    width: min(100vw - 30px, 1240px);
     padding-top: 12px;
   }
 

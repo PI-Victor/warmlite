@@ -2,7 +2,7 @@ use leptos::ev::Event;
 use leptos::prelude::*;
 use shared::{ControlOption, MonitorControl, MonitorSnapshot};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{window, HtmlDetailsElement, HtmlInputElement};
+use web_sys::{HtmlDetailsElement, HtmlInputElement, window};
 
 use crate::interop;
 
@@ -155,15 +155,11 @@ pub fn App() -> impl IntoView {
     });
 
     Effect::new(move |_| {
-        if let Some(window) = window() {
-            if let Some(document) = window.document() {
-                if let Some(root) = document.document_element() {
-                    let _ = root.set_attribute(
-                        "data-theme",
-                        theme_mode.get().attr(),
-                    );
-                }
-            }
+        if let Some(window) = window()
+            && let Some(document) = window.document()
+            && let Some(root) = document.document_element()
+        {
+            let _ = root.set_attribute("data-theme", theme_mode.get().attr());
         }
     });
 
@@ -172,7 +168,7 @@ pub fn App() -> impl IntoView {
             <header class="scene-topbar">
                 <div class="scene-brand">
                     <div class="brand-copy">
-                        <p class="eyebrow">"WarmLight"</p>
+                        <p class="eyebrow">"WarmLite"</p>
                         <strong>"Display Studio"</strong>
                     </div>
                 </div>
@@ -788,7 +784,7 @@ fn WarmSceneControl(
     local_error: RwSignal<String>,
     is_open: RwSignal<bool>,
 ) -> impl IntoView {
-    let active_scene = RwSignal::new(None::<String>);
+    let active_scene_id = RwSignal::new(None::<&'static str>);
     let monitor_id_for_scenes = StoredValue::new(monitor_id);
 
     view! {
@@ -803,7 +799,12 @@ fn WarmSceneControl(
                 <div>
                     <p class="panel-label">"Warm Scene"</p>
                     <strong class="panel-value surface-fold-value">
-                        {move || active_scene.get().unwrap_or_else(|| String::from("Manual gains"))}
+                        {move || {
+                            active_scene_id
+                                .get()
+                                .and_then(color_scene_label)
+                                .unwrap_or("Manual gains")
+                        }}
                     </strong>
                 </div>
             </summary>
@@ -820,7 +821,7 @@ fn WarmSceneControl(
                             view! {
                                 <button
                                     class=move || {
-                                        if active_scene.get().as_deref() == Some(scene.id) {
+                                        if active_scene_id.get() == Some(scene.id) {
                                             format!("choice-segment preset-segment {tone_class} active")
                                         } else {
                                             format!("choice-segment preset-segment {tone_class}")
@@ -831,7 +832,7 @@ fn WarmSceneControl(
                                     on:click=move |_| {
                                         is_busy.set(true);
                                         local_error.set(String::new());
-                                        active_scene.set(Some(scene.label.to_string()));
+                                        active_scene_id.set(Some(scene.id));
 
                                         let monitor_id = monitor_id.clone();
                                         spawn_local(async move {
@@ -890,10 +891,12 @@ fn AudioControlSection(
         .as_ref()
         .map(|control| control.label.clone())
         .unwrap_or_else(|| String::from("Audio Mute"));
-    let mute_error = mute_control.as_ref().and_then(|control| control.error.clone());
-    let volume_summary = volume_control
+    let mute_error = mute_control
         .as_ref()
-        .map(|control| slider_display(control.current_value.unwrap_or_default(), control.max_value));
+        .and_then(|control| control.error.clone());
+    let volume_summary = volume_control.as_ref().map(|control| {
+        slider_display(control.current_value.unwrap_or_default(), control.max_value)
+    });
     let mute_summary = mute_control
         .as_ref()
         .and_then(|control| control.current_value)
@@ -1814,84 +1817,122 @@ fn PowerModeSlider(
 ) -> impl IntoView {
     let options = control.options.clone();
     let label = control.label.clone();
-    let label_for_toggle = label.clone();
-    let off_option = power_mode_option(&options, false);
-    let on_option = power_mode_option(&options, true);
-    let control_supported = control.supported && off_option.is_some() && on_option.is_some();
+    let label_for_header = label.clone();
+    let label_for_group = label.clone();
+    let label_for_modal = label.clone();
+    let label_for_warning = label.clone();
+    let control_supported = control.supported && !options.is_empty();
     let control_error = control.error.clone();
-    let monitor_id_off = monitor_id.clone();
+    let monitor_id_apply = monitor_id.clone();
     let monitor_id_confirm = StoredValue::new(monitor_id.clone());
     let control_code = control.code.clone();
-    let control_code_off = control_code.clone();
+    let control_code_apply = control_code.clone();
     let control_code_confirm = StoredValue::new(control.code.clone());
-    let power_label_off = label_for_toggle.clone();
-    let power_label_confirm = StoredValue::new(label_for_toggle.clone());
-    let off_option_for_toggle = StoredValue::new(off_option.clone());
-    let on_option_for_toggle = StoredValue::new(on_option.clone());
-    let state = RwSignal::new(power_mode_is_on(control.current_value));
+    let power_label_apply = label.clone();
+    let power_label_confirm = StoredValue::new(label.clone());
+    let selected_value = RwSignal::new(control.current_value);
+    let options_for_value = StoredValue::new(options.clone());
     let show_power_confirm = RwSignal::new(false);
+    let pending_power_value = RwSignal::new(None::<u16>);
 
     view! {
         <section class="action-row toggle-row power-row">
             <div class="action-main">
                 <div class="action-copy">
-                    <p class="panel-label">{label.clone()}</p>
-                    <strong class="panel-value">{move || if state.get() { "On" } else { "Off" }}</strong>
+                    <p class="panel-label">{label_for_header.clone()}</p>
+                    <strong class="panel-value">
+                        {move || {
+                            match selected_value.get() {
+                                Some(value) => {
+                                    if value == 0x01 {
+                                        String::new()
+                                    } else {
+                                        option_label(&options_for_value.get_value(), value)
+                                    }
+                                }
+                                None => String::new(),
+                            }
+                        }}
+                    </strong>
                 </div>
+            </div>
 
-                <button
-                    class=move || {
-                        if state.get() {
-                            "switch-control on"
-                        } else {
-                            "switch-control"
+            <div class="choice-strip preset-choice-strip" aria-label=label_for_group.clone() role="group">
+                <For
+                    each=move || options.clone()
+                    key=|option| option.value
+                    children=move |option| {
+                        let option_value = option.value;
+                        let option_label = option.label.clone();
+                        let monitor_id = monitor_id_apply.clone();
+                        let control_code = control_code_apply.clone();
+                        let control_label = power_label_apply.clone();
+
+                        view! {
+                            <button
+                                class=move || {
+                                    if selected_value.get() == Some(option_value) {
+                                        "choice-segment active"
+                                    } else {
+                                        "choice-segment"
+                                    }
+                                }
+                                type="button"
+                                disabled=move || !control_supported || is_busy.get()
+                                on:click=move |_| {
+                                    if selected_value.get_untracked() == Some(option_value) {
+                                        return;
+                                    }
+
+                                    if power_mode_requires_confirmation(option_value) {
+                                        pending_power_value.set(Some(option_value));
+                                        show_power_confirm.set(true);
+                                        return;
+                                    }
+
+                                    let previous_value = selected_value.get_untracked();
+                                    selected_value.set(Some(option_value));
+                                    is_busy.set(true);
+                                    local_error.set(String::new());
+
+                                    let monitor_id = monitor_id.clone();
+                                    let control_code = control_code.clone();
+                                    let control_label = control_label.clone();
+
+                                    spawn_local(async move {
+                                        match interop::set_feature(&monitor_id, &control_code, option_value).await {
+                                            Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                            Err(error) => {
+                                                selected_value.set(previous_value);
+                                                local_error.set(format!("{control_label}: {error}"));
+                                            }
+                                        }
+
+                                        is_busy.set(false);
+                                    });
+                                }
+                            >
+                                {option_label}
+                            </button>
                         }
                     }
-                    type="button"
-                    disabled=move || !control_supported || is_busy.get()
-                    aria-label=label.clone()
-                    aria-pressed=move || state.get()
-                    on:click=move |_| {
-                        let Some(off_option) = off_option_for_toggle.get_value() else {
-                            return;
-                        };
-                        let Some(on_option) = on_option_for_toggle.get_value() else {
-                            return;
-                        };
-
-                        let next_on = !state.get_untracked();
-
-                        if !next_on {
-                            show_power_confirm.set(true);
-                            return;
-                        }
-
-                        apply_binary_choice(
-                            monitor_id_off.clone(),
-                            monitors,
-                            control_code_off.clone(),
-                            power_label_off.clone(),
-                            is_busy,
-                            local_error,
-                            state,
-                            next_on,
-                            off_option.value,
-                            on_option.value,
-                        );
-                    }
-                >
-                    <span class="switch-track">
-                        <span class="switch-thumb"></span>
-                    </span>
-                </button>
+                />
             </div>
 
             <Show when=move || show_power_confirm.get()>
                 <div class="modal-overlay" on:click=move |_| show_power_confirm.set(false)>
                     <div class="confirm-modal" on:click=move |event| event.stop_propagation()>
                         <div class="confirm-copy">
-                            <p class="panel-label">"Turn Monitor Off"</p>
-                            <strong>"Power off this display?"</strong>
+                            <p class="panel-label">{label_for_modal.clone()}</p>
+                            <strong>
+                                {move || {
+                                    let target = pending_power_value.get().unwrap_or(0x04);
+                                    format!(
+                                        "Switch to {}?",
+                                        option_label(&options_for_value.get_value(), target)
+                                    )
+                                }}
+                            </strong>
                             <p class="support-note">
                                 "You may need to power it back on manually."
                             </p>
@@ -1910,31 +1951,36 @@ fn PowerModeSlider(
                                 class="button confirm-button danger"
                                 type="button"
                                 on:click=move |_| {
-                                    let Some(off_option) = off_option_for_toggle.get_value() else {
-                                        show_power_confirm.set(false);
-                                        return;
-                                    };
-                                    let Some(on_option) = on_option_for_toggle.get_value() else {
+                                    let Some(target_value) = pending_power_value.get() else {
                                         show_power_confirm.set(false);
                                         return;
                                     };
 
+                                    let previous_value = selected_value.get_untracked();
+                                    selected_value.set(Some(target_value));
                                     show_power_confirm.set(false);
-                                    apply_binary_choice(
-                                        monitor_id_confirm.get_value(),
-                                        monitors,
-                                        control_code_confirm.get_value(),
-                                        power_label_confirm.get_value(),
-                                        is_busy,
-                                        local_error,
-                                        state,
-                                        false,
-                                        off_option.value,
-                                        on_option.value,
-                                    );
+                                    pending_power_value.set(None);
+                                    is_busy.set(true);
+                                    local_error.set(String::new());
+
+                                    let monitor_id = monitor_id_confirm.get_value();
+                                    let control_code = control_code_confirm.get_value();
+                                    let control_label = power_label_confirm.get_value();
+
+                                    spawn_local(async move {
+                                        match interop::set_feature(&monitor_id, &control_code, target_value).await {
+                                            Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                            Err(error) => {
+                                                selected_value.set(previous_value);
+                                                local_error.set(format!("{control_label}: {error}"));
+                                            }
+                                        }
+
+                                        is_busy.set(false);
+                                    });
                                 }
                             >
-                                "Turn Off"
+                                "Apply"
                             </button>
                         </div>
                     </div>
@@ -1945,11 +1991,15 @@ fn PowerModeSlider(
                 <p class="support-note warning">
                     {control_error
                         .clone()
-                        .unwrap_or_else(|| format!("{} is unavailable.", label))}
+                        .unwrap_or_else(|| format!("{} is unavailable.", label_for_warning))}
                 </p>
             </Show>
         </section>
     }
+}
+
+fn power_mode_requires_confirmation(value: u16) -> bool {
+    matches!(value, 0x04 | 0x05)
 }
 
 fn glide_label(delay_ms: u16) -> String {
@@ -1978,7 +2028,11 @@ fn preset_tone_class(label: &str) -> &'static str {
         "tone-crisp"
     } else if lower.contains("7500") || lower.contains("8200") || lower.contains("cool") {
         "tone-cool"
-    } else if lower.contains("9300") || lower.contains("11500") || lower.contains("blue") || lower.contains("ice") {
+    } else if lower.contains("9300")
+        || lower.contains("11500")
+        || lower.contains("blue")
+        || lower.contains("ice")
+    {
         "tone-blue"
     } else {
         "tone-custom"
@@ -1992,6 +2046,13 @@ fn warm_scene_tone_class(scene_id: &str) -> &'static str {
         "nocturne" => "tone-blue",
         _ => "tone-custom",
     }
+}
+
+fn color_scene_label(scene_id: &str) -> Option<&'static str> {
+    COLOR_SCENES
+        .iter()
+        .find(|scene| scene.id == scene_id)
+        .map(|scene| scene.label)
 }
 
 fn slider_display(current: u16, maximum: Option<u16>) -> String {
@@ -2017,66 +2078,6 @@ fn option_label(options: &[ControlOption], value: u16) -> String {
         .find(|option| option.value == value)
         .map(|option| option.label.clone())
         .unwrap_or_else(|| format!("Value {value}"))
-}
-
-fn power_mode_option(options: &[ControlOption], want_on: bool) -> Option<ControlOption> {
-    if want_on {
-        options
-            .iter()
-            .find(|option| option.value == 0x01)
-            .cloned()
-            .or_else(|| options.iter().find(|option| option.value != 0x04).cloned())
-    } else {
-        options
-            .iter()
-            .find(|option| option.value == 0x05)
-            .cloned()
-            .or_else(|| options
-                .iter()
-            .find(|option| option.value == 0x04)
-            .cloned())
-            .or_else(|| options.iter().find(|option| option.value != 0x01).cloned())
-    }
-}
-
-fn power_mode_is_on(current_value: Option<u16>) -> bool {
-    current_value.map(|value| value != 0x04).unwrap_or(false)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_binary_choice(
-    monitor_id: String,
-    monitors: RwSignal<Vec<MonitorSnapshot>>,
-    control_code: String,
-    control_label: String,
-    is_busy: RwSignal<bool>,
-    local_error: RwSignal<String>,
-    state: RwSignal<bool>,
-    next_on: bool,
-    off_value: u16,
-    on_value: u16,
-) {
-    if state.get_untracked() == next_on {
-        return;
-    }
-
-    let next_value = if next_on { on_value } else { off_value };
-
-    state.set(next_on);
-    is_busy.set(true);
-    local_error.set(String::new());
-
-    spawn_local(async move {
-        match interop::set_feature(&monitor_id, &control_code, next_value).await {
-            Ok(updated) => replace_monitor_snapshot(monitors, updated),
-            Err(error) => {
-                state.set(!next_on);
-                local_error.set(format!("{control_label}: {error}"));
-            }
-        }
-
-        is_busy.set(false);
-    });
 }
 
 fn monitor_subtitle(monitor: &MonitorSnapshot) -> String {
@@ -2108,7 +2109,10 @@ fn display_switch_meta(monitor: &MonitorSnapshot) -> String {
 }
 
 fn monitor_transport_label(monitor: &MonitorSnapshot) -> Option<String> {
-    monitor.device_path.as_ref().map(|path| format!("dev:{path}"))
+    monitor
+        .device_path
+        .as_ref()
+        .map(|path| format!("dev:{path}"))
 }
 
 fn queue_range_change(ctx: RangeChangeContext, parsed: u16) {

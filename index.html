@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="system">
   <head>
     <meta charset="utf-8" />
     <meta
@@ -7,6 +7,16 @@
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
     <title>WarmLite</title>
+    <script>
+      (() => {
+        try {
+          const theme = localStorage.getItem("warmlite.theme");
+          if (theme === "light" || theme === "dark" || theme === "system") {
+            document.documentElement.setAttribute("data-theme", theme);
+          }
+        } catch (_) {}
+      })();
+    </script>
     <link data-trunk rel="css" href="styles/app.css" />
     <link data-trunk rel="rust" data-bin="warmlite-ui" />
   </head>

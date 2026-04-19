@@ -1,10 +1,19 @@
 use leptos::ev::Event;
 use leptos::prelude::*;
 use shared::{ControlOption, MonitorControl, MonitorSnapshot};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::future::{Future, poll_fn};
+use std::rc::Rc;
+use std::task::{Poll, Waker};
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
+use web_sys::js_sys;
 use web_sys::{HtmlDetailsElement, HtmlInputElement, window};
 
 use crate::interop;
+
+const THEME_STORAGE_KEY: &str = "warmlite.theme";
 
 #[derive(Clone)]
 struct RangeChangeContext {
@@ -17,6 +26,26 @@ struct RangeChangeContext {
     monitors: RwSignal<Vec<MonitorSnapshot>>,
     local_error: RwSignal<String>,
     control_label: String,
+    sync_enabled: RwSignal<bool>,
+    range_overrides: RwSignal<HashMap<String, u16>>,
+}
+
+#[derive(Clone)]
+struct BinaryToggleConfig {
+    on_value: u16,
+    on_label: String,
+    off_value: u16,
+    off_label: String,
+}
+
+#[derive(Clone, Copy)]
+struct SyncControlsState {
+    enabled: RwSignal<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct RangeOverrideState {
+    values: RwSignal<HashMap<String, u16>>,
 }
 
 #[derive(Clone, Copy)]
@@ -30,7 +59,6 @@ struct SurfaceFoldState {
     manual_gains: RwSignal<bool>,
     warm_scene: RwSignal<bool>,
     input_source: RwSignal<bool>,
-    display_mode: RwSignal<bool>,
     audio: RwSignal<bool>,
     osd: RwSignal<bool>,
     restore: RwSignal<bool>,
@@ -65,6 +93,15 @@ impl ThemeMode {
             Self::System => "Theme: System",
             Self::Dark => "Theme: Dark",
             Self::Light => "Theme: Light",
+        }
+    }
+
+    fn from_attr(value: &str) -> Option<Self> {
+        match value {
+            "system" => Some(Self::System),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
         }
     }
 }
@@ -103,12 +140,13 @@ pub fn App() -> impl IntoView {
     let status = RwSignal::new(String::from("Scanning displays..."));
     let is_loading = RwSignal::new(false);
     let glide_delay_ms = RwSignal::new(18_u16);
-    let theme_mode = RwSignal::new(ThemeMode::System);
+    let theme_mode = RwSignal::new(load_theme_mode());
+    let sync_across_screens = RwSignal::new(false);
+    let range_overrides = RwSignal::new(HashMap::<String, u16>::new());
     let surface_folds = SurfaceFoldState {
         manual_gains: RwSignal::new(false),
         warm_scene: RwSignal::new(false),
         input_source: RwSignal::new(false),
-        display_mode: RwSignal::new(false),
         audio: RwSignal::new(false),
         osd: RwSignal::new(false),
         restore: RwSignal::new(false),
@@ -159,8 +197,17 @@ pub fn App() -> impl IntoView {
             && let Some(document) = window.document()
             && let Some(root) = document.document_element()
         {
-            let _ = root.set_attribute("data-theme", theme_mode.get().attr());
+            let theme = theme_mode.get();
+            let _ = root.set_attribute("data-theme", theme.attr());
+            save_theme_mode(theme);
         }
+    });
+
+    provide_context(SyncControlsState {
+        enabled: sync_across_screens,
+    });
+    provide_context(RangeOverrideState {
+        values: range_overrides,
     });
 
     view! {
@@ -180,6 +227,23 @@ pub fn App() -> impl IntoView {
                         on:click=move |_| theme_mode.update(|mode| *mode = mode.next())
                     >
                         {move || theme_mode.get().label()}
+                    </button>
+
+                    <button
+                        class=move || {
+                            if sync_across_screens.get() {
+                                "switch-control on toolbar-switch"
+                            } else {
+                                "switch-control toolbar-switch"
+                            }
+                        }
+                        type="button"
+                        on:click=move |_| sync_across_screens.update(|enabled| *enabled = !*enabled)
+                    >
+                        <span class="switch-track">
+                            <span class="switch-thumb"></span>
+                        </span>
+                        <span class="switch-copy">"Sync screens"</span>
                     </button>
 
                     <div class="glide-inline">
@@ -213,6 +277,18 @@ pub fn App() -> impl IntoView {
                         disabled=move || is_loading.get()
                     >
                         {move || if is_loading.get() { "Loading" } else { "Refresh" }}
+                    </button>
+
+                    <button
+                        class="button ghost toolbar-button"
+                        type="button"
+                        on:click=move |_| {
+                            spawn_local(async move {
+                                let _ = interop::quit_app().await;
+                            });
+                        }
+                    >
+                        "Quit"
                     </button>
                 </div>
             </header>
@@ -322,24 +398,22 @@ fn MonitorStage(
     let power_control = find_control(&monitor.controls, "D6");
     let volume_control = find_control(&monitor.controls, "62");
     let input_source_control = find_control(&monitor.controls, "60");
-    let display_mode_control = find_control(&monitor.controls, "DC");
     let osd_controls: Vec<_> = monitor
         .controls
         .iter()
-        .filter(|control| matches!(control.code.as_str(), "02" | "CA" | "CC"))
+        .filter(|control| matches!(control.code.as_str(), "CA" | "CC"))
         .cloned()
         .collect();
     let action_controls: Vec<_> = monitor
         .controls
         .iter()
-        .filter(|control| matches!(control.code.as_str(), "04" | "05" | "08" | "B0"))
+        .filter(|control| matches!(control.code.as_str(), "04" | "05" | "08"))
         .cloned()
         .collect();
     let mute_control_for_view = StoredValue::new(mute_control.clone());
     let power_control_for_view = StoredValue::new(power_control.clone());
     let volume_control_for_view = StoredValue::new(volume_control.clone());
     let input_source_control_for_view = StoredValue::new(input_source_control.clone());
-    let display_mode_control_for_view = StoredValue::new(display_mode_control.clone());
     let osd_controls_for_view = StoredValue::new(osd_controls.clone());
     let action_controls_for_view = StoredValue::new(action_controls.clone());
     let gain_controls: Vec<_> = monitor
@@ -357,6 +431,8 @@ fn MonitorStage(
     } else {
         "limited"
     };
+    let monitor_id_brightness_meter = monitor.id.clone();
+    let monitor_id_contrast_meter = monitor.id.clone();
     let monitor_id_center = monitor.id.clone();
     let monitor_id_center_contrast = monitor.id.clone();
     let monitor_id_audio = monitor.id.clone();
@@ -528,7 +604,6 @@ fn MonitorStage(
                             <Show
                                 when=move || {
                                     input_source_control_for_view.get_value().is_some()
-                                        || display_mode_control_for_view.get_value().is_some()
                                         || has_audio_controls
                                 }
                             >
@@ -544,20 +619,6 @@ fn MonitorStage(
                                                     local_error
                                                     variant="surface"
                                                     open_state=Some(surface_folds.input_source)
-                                                />
-                                            </div>
-                                        </Show>
-
-                                        <Show when=move || display_mode_control_for_view.get_value().is_some()>
-                                            <div class="surface-inline surface-inline-narrow">
-                                                <ChoiceControl
-                                                    monitor_id=monitor_id_surface_controls.get_value()
-                                                    monitors
-                                                    control=display_mode_control_for_view.get_value().unwrap()
-                                                    is_busy
-                                                    local_error
-                                                    variant="surface"
-                                                    open_state=Some(surface_folds.display_mode)
                                                 />
                                             </div>
                                         </Show>
@@ -616,6 +677,7 @@ fn MonitorStage(
                         fallback=|| view! { <div class="meter-placeholder"></div> }
                     >
                         <PrimaryRangeControl
+                            monitor_id=monitor_id_brightness_meter.clone()
                             control=brightness_meter.clone().unwrap()
                         />
                     </Show>
@@ -625,6 +687,7 @@ fn MonitorStage(
                         fallback=|| view! { <div class="meter-placeholder"></div> }
                     >
                         <PrimaryRangeControl
+                            monitor_id=monitor_id_contrast_meter.clone()
                             control=contrast_meter.clone().unwrap()
                         />
                     </Show>
@@ -654,6 +717,7 @@ fn PresetSceneControl(
     is_busy: RwSignal<bool>,
     local_error: RwSignal<String>,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
     let monitor_id_for_presets = StoredValue::new(monitor_id.clone());
     let preset_selected_value = RwSignal::new(
         preset_control
@@ -741,10 +805,17 @@ fn PresetSceneControl(
                                             let monitor_id = monitor_id.clone();
                                             let control_code = control_code.clone();
                                             let control_label = control_label.clone();
+                                            let sync_enabled = sync_enabled.get_untracked();
 
                                             spawn_local(async move {
-                                                match interop::set_feature(&monitor_id, &control_code, option_value).await {
-                                                    Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                                match apply_feature_write(
+                                                    monitors,
+                                                    &monitor_id,
+                                                    &control_code,
+                                                    option_value,
+                                                    sync_enabled,
+                                                ).await {
+                                                    Ok(()) => {}
                                                     Err(error) => local_error.set(format!("{control_label}: {error}")),
                                                 }
 
@@ -784,6 +855,7 @@ fn WarmSceneControl(
     local_error: RwSignal<String>,
     is_open: RwSignal<bool>,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
     let active_scene_id = RwSignal::new(None::<&'static str>);
     let monitor_id_for_scenes = StoredValue::new(monitor_id);
 
@@ -835,9 +907,15 @@ fn WarmSceneControl(
                                         active_scene_id.set(Some(scene.id));
 
                                         let monitor_id = monitor_id.clone();
+                                        let sync_enabled = sync_enabled.get_untracked();
                                         spawn_local(async move {
-                                            match interop::apply_color_scene(&monitor_id, scene.id).await {
-                                                Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                            match apply_color_scene_write(
+                                                monitors,
+                                                &monitor_id,
+                                                scene.id,
+                                                sync_enabled,
+                                            ).await {
+                                                Ok(()) => {}
                                                 Err(error) => local_error.set(format!("Custom Scene: {error}")),
                                             }
 
@@ -868,6 +946,7 @@ fn AudioControlSection(
     local_error: RwSignal<String>,
     is_open: RwSignal<bool>,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
     let has_mute_control = mute_control.is_some();
     let mute_options = mute_control
         .as_ref()
@@ -897,15 +976,13 @@ fn AudioControlSection(
     let volume_summary = volume_control.as_ref().map(|control| {
         slider_display(control.current_value.unwrap_or_default(), control.max_value)
     });
-    let mute_summary = mute_control
-        .as_ref()
-        .and_then(|control| control.current_value)
-        .map(|value| option_label(&mute_options, value));
+    let mute_toggle = binary_toggle_config(&mute_options);
     let volume_control_for_view = StoredValue::new(volume_control.clone());
     let mute_options_for_each = StoredValue::new(mute_options.clone());
     let monitor_id_for_mute = StoredValue::new(monitor_id.clone());
     let mute_control_code_for_actions = StoredValue::new(mute_control_code.clone());
     let mute_control_label_for_actions = StoredValue::new(mute_control_label.clone());
+    let mute_toggle_for_view = StoredValue::new(mute_toggle.clone());
 
     view! {
         <details
@@ -920,8 +997,8 @@ fn AudioControlSection(
                     <p class="panel-label">"Audio"</p>
                     <strong class="panel-value surface-fold-value">
                         {move || {
-                            if let Some(summary) = mute_summary.clone() {
-                                summary
+                            if has_mute_control {
+                                option_label(&mute_options_for_each.get_value(), mute_selected_value.get())
                             } else if let Some(summary) = volume_summary.clone() {
                                 summary
                             } else {
@@ -933,58 +1010,145 @@ fn AudioControlSection(
             </summary>
 
             <div class="surface-fold-body">
-                <Show when=move || !mute_options_for_each.get_value().is_empty()>
-                    <div class="choice-strip preset-choice-strip" role="group" aria-label="Audio mute">
-                        <For
-                            each=move || mute_options_for_each.get_value()
-                            key=|option| option.value
-                            children=move |option| {
-                                let option_value = option.value;
-                                let option_label_text = option.label.clone();
-                                let monitor_id = monitor_id_for_mute.get_value();
-                                let control_code = mute_control_code_for_actions.get_value();
-                                let control_label = mute_control_label_for_actions.get_value();
+                <Show
+                    when=move || mute_toggle_for_view.get_value().is_some()
+                    fallback=move || {
+                        view! {
+                            <Show when=move || !mute_options_for_each.get_value().is_empty()>
+                                <div class="choice-strip preset-choice-strip" role="group" aria-label="Audio mute">
+                                    <For
+                                        each=move || mute_options_for_each.get_value()
+                                        key=|option| option.value
+                                        children=move |option| {
+                                            let option_value = option.value;
+                                            let option_label_text = option.label.clone();
+                                            let monitor_id = monitor_id_for_mute.get_value();
+                                            let control_code = mute_control_code_for_actions.get_value();
+                                            let control_label = mute_control_label_for_actions.get_value();
 
-                                view! {
-                                    <button
-                                        class=move || {
-                                            if mute_selected_value.get() == option_value {
-                                                "choice-segment active"
-                                            } else {
-                                                "choice-segment"
+                                            view! {
+                                                <button
+                                                    class=move || {
+                                                        if mute_selected_value.get() == option_value {
+                                                            "choice-segment active"
+                                                        } else {
+                                                            "choice-segment"
+                                                        }
+                                                    }
+                                                    type="button"
+                                                    disabled=move || !mute_supported || is_busy.get()
+                                                    on:click=move |_| {
+                                                        if mute_selected_value.get_untracked() == option_value {
+                                                            return;
+                                                        }
+
+                                                        mute_selected_value.set(option_value);
+                                                        is_busy.set(true);
+                                                        local_error.set(String::new());
+
+                                                        let monitor_id = monitor_id.clone();
+                                                        let control_code = control_code.clone();
+                                                        let control_label = control_label.clone();
+                                                        let sync_enabled = sync_enabled.get_untracked();
+
+                                                        spawn_local(async move {
+                                                            match apply_feature_write(
+                                                                monitors,
+                                                                &monitor_id,
+                                                                &control_code,
+                                                                option_value,
+                                                                sync_enabled,
+                                                            ).await {
+                                                                Ok(()) => {}
+                                                                Err(error) => local_error.set(format!("{control_label}: {error}")),
+                                                            }
+
+                                                            is_busy.set(false);
+                                                        });
+                                                    }
+                                                >
+                                                    {option_label_text}
+                                                </button>
                                             }
                                         }
-                                        type="button"
-                                        disabled=move || !mute_supported || is_busy.get()
-                                        on:click=move |_| {
-                                            if mute_selected_value.get_untracked() == option_value {
-                                                return;
-                                            }
-
-                                            mute_selected_value.set(option_value);
-                                            is_busy.set(true);
-                                            local_error.set(String::new());
-
-                                            let monitor_id = monitor_id.clone();
-                                            let control_code = control_code.clone();
-                                            let control_label = control_label.clone();
-
-                                            spawn_local(async move {
-                                                match interop::set_feature(&monitor_id, &control_code, option_value).await {
-                                                    Ok(updated) => replace_monitor_snapshot(monitors, updated),
-                                                    Err(error) => local_error.set(format!("{control_label}: {error}")),
-                                                }
-
-                                                is_busy.set(false);
-                                            });
-                                        }
-                                    >
-                                        {option_label_text}
-                                    </button>
-                                }
+                                    />
+                                </div>
+                            </Show>
+                        }
+                    }
+                >
+                    <button
+                        class=move || {
+                            let is_on = mute_toggle_for_view
+                                .get_value()
+                                .map(|config| mute_selected_value.get() == config.on_value)
+                                .unwrap_or(false);
+                            if is_on {
+                                "switch-control on"
+                            } else {
+                                "switch-control"
                             }
-                        />
-                    </div>
+                        }
+                        type="button"
+                        disabled=move || !mute_supported || is_busy.get()
+                        on:click=move |_| {
+                            let Some(config) = mute_toggle_for_view.get_value() else {
+                                return;
+                            };
+
+                            let next_value = if mute_selected_value.get_untracked() == config.on_value {
+                                config.off_value
+                            } else {
+                                config.on_value
+                            };
+
+                            if mute_selected_value.get_untracked() == next_value {
+                                return;
+                            }
+
+                            mute_selected_value.set(next_value);
+                            is_busy.set(true);
+                            local_error.set(String::new());
+
+                            let monitor_id = monitor_id_for_mute.get_value();
+                            let control_code = mute_control_code_for_actions.get_value();
+                            let control_label = mute_control_label_for_actions.get_value();
+                            let sync_enabled = sync_enabled.get_untracked();
+
+                            spawn_local(async move {
+                                match apply_feature_write(
+                                    monitors,
+                                    &monitor_id,
+                                    &control_code,
+                                    next_value,
+                                    sync_enabled,
+                                ).await {
+                                    Ok(()) => {}
+                                    Err(error) => local_error.set(format!("{control_label}: {error}")),
+                                }
+
+                                is_busy.set(false);
+                            });
+                        }
+                    >
+                        <span class="switch-track">
+                            <span class="switch-thumb"></span>
+                        </span>
+                        <span class="switch-copy">
+                            {move || {
+                                mute_toggle_for_view
+                                    .get_value()
+                                    .map(|config| {
+                                        if mute_selected_value.get() == config.on_value {
+                                            config.on_label
+                                        } else {
+                                            config.off_label
+                                        }
+                                    })
+                                    .unwrap_or_else(|| option_label(&mute_options_for_each.get_value(), mute_selected_value.get()))
+                            }}
+                        </span>
+                    </button>
                 </Show>
 
                 <Show when=move || volume_control_for_view.get_value().is_some()>
@@ -1066,6 +1230,7 @@ fn SurfaceChoiceRow(
     is_busy: RwSignal<bool>,
     local_error: RwSignal<String>,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
     let selected_value = RwSignal::new(control.current_value.unwrap_or_default());
     let control_code = control.code.clone();
     let control_label = control.label.clone();
@@ -1075,6 +1240,12 @@ fn SurfaceChoiceRow(
     let control_label_for_warning = control_label.clone();
     let options = control.options.clone();
     let options_for_label = StoredValue::new(options.clone());
+    let options_for_each = StoredValue::new(options.clone());
+    let toggle_config = binary_toggle_config(&options);
+    let toggle_config_for_view = StoredValue::new(toggle_config);
+    let monitor_id_for_actions = StoredValue::new(monitor_id.clone());
+    let control_code_for_actions = StoredValue::new(control_code.clone());
+    let control_label_for_actions = StoredValue::new(control_label.clone());
 
     view! {
         <section class="action-row surface-choice-row">
@@ -1093,57 +1264,141 @@ fn SurfaceChoiceRow(
                 </div>
             </div>
 
-            <div class="choice-strip preset-choice-strip" role="group" aria-label=control_heading_label.clone()>
-                <For
-                    each=move || options.clone()
-                    key=|option| option.value
-                    children=move |option| {
-                        let option_value = option.value;
-                        let option_label_text = option.label.clone();
-                        let monitor_id = monitor_id.clone();
-                        let control_code = control_code.clone();
-                        let control_label = control_label.clone();
+            <Show
+                when=move || toggle_config_for_view.get_value().is_some()
+                fallback=move || {
+                    view! {
+                        <div class="choice-strip preset-choice-strip" role="group" aria-label=control_heading_label.clone()>
+                            <For
+                                each=move || options_for_each.get_value()
+                                key=|option| option.value
+                                children=move |option| {
+                                    let option_value = option.value;
+                                    let option_label_text = option.label.clone();
 
-                        view! {
-                            <button
-                                class=move || {
-                                    if selected_value.get() == option_value {
-                                        "choice-segment active"
-                                    } else {
-                                        "choice-segment"
+                                    view! {
+                                        <button
+                                            class=move || {
+                                                if selected_value.get() == option_value {
+                                                    "choice-segment active"
+                                                } else {
+                                                    "choice-segment"
+                                                }
+                                            }
+                                            type="button"
+                                            disabled=move || !control_supported || is_busy.get()
+                                            on:click=move |_| {
+                                                if selected_value.get_untracked() == option_value {
+                                                    return;
+                                                }
+
+                                                selected_value.set(option_value);
+                                                is_busy.set(true);
+                                                local_error.set(String::new());
+
+                                                let monitor_id = monitor_id_for_actions.get_value();
+                                                let control_code = control_code_for_actions.get_value();
+                                                let control_label = control_label_for_actions.get_value();
+                                                let sync_enabled = sync_enabled.get_untracked();
+
+                                                spawn_local(async move {
+                                                    match apply_feature_write(
+                                                        monitors,
+                                                        &monitor_id,
+                                                        &control_code,
+                                                        option_value,
+                                                        sync_enabled,
+                                                    ).await {
+                                                        Ok(()) => {}
+                                                        Err(error) => local_error.set(format!("{control_label}: {error}")),
+                                                    }
+
+                                                    is_busy.set(false);
+                                                });
+                                            }
+                                        >
+                                            {option_label_text}
+                                        </button>
                                     }
                                 }
-                                type="button"
-                                disabled=move || !control_supported || is_busy.get()
-                                on:click=move |_| {
-                                    if selected_value.get_untracked() == option_value {
-                                        return;
-                                    }
-
-                                    selected_value.set(option_value);
-                                    is_busy.set(true);
-                                    local_error.set(String::new());
-
-                                    let monitor_id = monitor_id.clone();
-                                    let control_code = control_code.clone();
-                                    let control_label = control_label.clone();
-
-                                    spawn_local(async move {
-                                        match interop::set_feature(&monitor_id, &control_code, option_value).await {
-                                            Ok(updated) => replace_monitor_snapshot(monitors, updated),
-                                            Err(error) => local_error.set(format!("{control_label}: {error}")),
-                                        }
-
-                                        is_busy.set(false);
-                                    });
-                                }
-                            >
-                                {option_label_text}
-                            </button>
+                            />
+                        </div>
+                    }
+                }
+            >
+                <button
+                    class=move || {
+                        let is_on = toggle_config_for_view
+                            .get_value()
+                            .map(|config| selected_value.get() == config.on_value)
+                            .unwrap_or(false);
+                        if is_on {
+                            "switch-control on"
+                        } else {
+                            "switch-control"
                         }
                     }
-                />
-            </div>
+                    type="button"
+                    disabled=move || !control_supported || is_busy.get()
+                    on:click=move |_| {
+                        let Some(config) = toggle_config_for_view.get_value() else {
+                            return;
+                        };
+
+                        let next_value = if selected_value.get_untracked() == config.on_value {
+                            config.off_value
+                        } else {
+                            config.on_value
+                        };
+
+                        if selected_value.get_untracked() == next_value {
+                            return;
+                        }
+
+                        selected_value.set(next_value);
+                        is_busy.set(true);
+                        local_error.set(String::new());
+
+                        let monitor_id = monitor_id_for_actions.get_value();
+                        let control_code = control_code_for_actions.get_value();
+                        let control_label = control_label_for_actions.get_value();
+                        let sync_enabled = sync_enabled.get_untracked();
+
+                        spawn_local(async move {
+                            match apply_feature_write(
+                                monitors,
+                                &monitor_id,
+                                &control_code,
+                                next_value,
+                                sync_enabled,
+                            ).await {
+                                Ok(()) => {}
+                                Err(error) => local_error.set(format!("{control_label}: {error}")),
+                            }
+
+                            is_busy.set(false);
+                        });
+                    }
+                >
+                    <span class="switch-track">
+                        <span class="switch-thumb"></span>
+                    </span>
+                    <span class="switch-copy">
+                        {move || {
+                            toggle_config_for_view
+                                .get_value()
+                                .map(|config| {
+                                    if selected_value.get() == config.on_value {
+                                        config.on_label
+                                    } else {
+                                        config.off_label
+                                    }
+                                })
+                                .unwrap_or_else(|| option_label(&options_for_label.get_value(), selected_value.get()))
+                        }}
+                    </span>
+                </button>
+            </Show>
 
             <Show when=move || !control_supported>
                 <p class="support-note warning">
@@ -1192,7 +1447,7 @@ fn ActionControlSection(
                 <div>
                     <p class="panel-label">"Restore & Store"</p>
                     <strong class="panel-value surface-fold-value">
-                        "Reset defaults or store the current mode"
+                        "Reset display defaults"
                     </strong>
                 </div>
             </summary>
@@ -1248,6 +1503,7 @@ fn SurfaceActionButton(
     is_busy: RwSignal<bool>,
     local_error: RwSignal<String>,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
     let option = control.options.first().cloned();
     let label = control.label.clone();
     let label_for_warning = label.clone();
@@ -1271,10 +1527,17 @@ fn SurfaceActionButton(
                 let monitor_id = monitor_id.clone();
                 let control_code = control_code.clone();
                 let label = label.clone();
+                let sync_enabled = sync_enabled.get_untracked();
 
                 spawn_local(async move {
-                    match interop::set_feature(&monitor_id, &control_code, option.value).await {
-                        Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                    match apply_feature_write(
+                        monitors,
+                        &monitor_id,
+                        &control_code,
+                        option.value,
+                        sync_enabled,
+                    ).await {
+                        Ok(()) => {}
                         Err(error) => local_error.set(format!("{label}: {error}")),
                     }
 
@@ -1301,6 +1564,7 @@ fn SurfaceActionRow(
     is_busy: RwSignal<bool>,
     local_error: RwSignal<String>,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
     let control_code = control.code.clone();
     let control_code_for_key = control.code.clone();
     let control_label = control.label.clone();
@@ -1347,10 +1611,17 @@ fn SurfaceActionRow(
                                     let monitor_id = monitor_id.clone();
                                     let control_code = control_code.clone();
                                     let control_label = control_label.clone();
+                                    let sync_enabled = sync_enabled.get_untracked();
 
                                     spawn_local(async move {
-                                        match interop::set_feature(&monitor_id, &control_code, option_value).await {
-                                            Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                        match apply_feature_write(
+                                            monitors,
+                                            &monitor_id,
+                                            &control_code,
+                                            option_value,
+                                            sync_enabled,
+                                        ).await {
+                                            Ok(()) => {}
                                             Err(error) => local_error.set(format!("{control_label}: {error}")),
                                         }
 
@@ -1377,9 +1648,24 @@ fn SurfaceActionRow(
 }
 
 #[component]
-fn PrimaryRangeControl(control: MonitorControl) -> impl IntoView {
+fn PrimaryRangeControl(
+    monitor_id: String,
+    control: MonitorControl,
+) -> impl IntoView {
+    let range_overrides = expect_context::<RangeOverrideState>().values;
     let max_value = control.max_value.unwrap_or(100);
-    let current_value = control.current_value.unwrap_or_default();
+    let monitor_id_for_head = monitor_id.clone();
+    let monitor_id_for_legend = monitor_id.clone();
+    let control_code_for_head = control.code.clone();
+    let control_code_for_legend = control.code.clone();
+    let current_value_head = move || {
+        range_override_value(range_overrides, &monitor_id_for_head, &control_code_for_head)
+            .unwrap_or(control.current_value.unwrap_or_default())
+    };
+    let current_value_legend = move || {
+        range_override_value(range_overrides, &monitor_id_for_legend, &control_code_for_legend)
+            .unwrap_or(control.current_value.unwrap_or_default())
+    };
 
     view! {
         <section class=move || {
@@ -1391,7 +1677,7 @@ fn PrimaryRangeControl(control: MonitorControl) -> impl IntoView {
         }>
             <div class="meter-head">
                 <p class="meter-label">{control.label.clone()}</p>
-                <strong class="meter-number">{current_value}</strong>
+                <strong class="meter-number">{current_value_head}</strong>
             </div>
 
             <div class="meter-legend">
@@ -1401,7 +1687,7 @@ fn PrimaryRangeControl(control: MonitorControl) -> impl IntoView {
                 </span>
                 <span>
                     <em>"current"</em>
-                    <strong>{current_value}</strong>
+                    <strong>{current_value_legend}</strong>
                 </span>
                 <span>
                     <em>"max"</em>
@@ -1427,7 +1713,12 @@ fn CenterRangeControl(
     local_error: RwSignal<String>,
     tone: &'static str,
 ) -> impl IntoView {
-    let slider_value = RwSignal::new(control.current_value.unwrap_or_default());
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
+    let range_overrides = expect_context::<RangeOverrideState>().values;
+    let slider_value = RwSignal::new(
+        range_override_value_untracked(range_overrides, &monitor_id, &control.code)
+            .unwrap_or(control.current_value.unwrap_or_default()),
+    );
     let range_change = RangeChangeContext {
         monitor_id: monitor_id.clone(),
         control_code: control.code.clone(),
@@ -1438,6 +1729,8 @@ fn CenterRangeControl(
         monitors,
         local_error,
         control_label: control.label.clone(),
+        sync_enabled,
+        range_overrides,
     };
     let maximum = control.max_value.unwrap_or(100);
 
@@ -1445,6 +1738,7 @@ fn CenterRangeControl(
         let input = event_target::<HtmlInputElement>(&event);
         if let Ok(parsed) = input.value().parse::<u16>() {
             slider_value.set(parsed);
+            set_range_override(range_overrides, &monitor_id, &control.code, parsed);
         }
     };
 
@@ -1503,8 +1797,13 @@ fn RangeControl(
     local_error: RwSignal<String>,
     variant: &'static str,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
+    let range_overrides = expect_context::<RangeOverrideState>().values;
     let _ = is_busy;
-    let slider_value = RwSignal::new(control.current_value.unwrap_or_default());
+    let slider_value = RwSignal::new(
+        range_override_value_untracked(range_overrides, &monitor_id, &control.code)
+            .unwrap_or(control.current_value.unwrap_or_default()),
+    );
     let range_change = RangeChangeContext {
         monitor_id: monitor_id.clone(),
         control_code: control.code.clone(),
@@ -1515,12 +1814,15 @@ fn RangeControl(
         monitors,
         local_error,
         control_label: control.label.clone(),
+        sync_enabled,
+        range_overrides,
     };
 
     let on_input = move |event: Event| {
         let input = event_target::<HtmlInputElement>(&event);
         if let Ok(parsed) = input.value().parse::<u16>() {
             slider_value.set(parsed);
+            set_range_override(range_overrides, &monitor_id, &control.code, parsed);
         }
     };
 
@@ -1677,6 +1979,7 @@ fn ChoiceControl(
     variant: &'static str,
     open_state: Option<RwSignal<bool>>,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
     let selected_value = RwSignal::new(control.current_value.unwrap_or_default());
     let control_code = control.code.clone();
     let control_label = control.label.clone();
@@ -1719,13 +2022,20 @@ fn ChoiceControl(
                                     let monitor_id = monitor_id.clone();
                                     let control_code = control_code.clone();
                                     let control_label = control_label.clone();
+                                    let sync_enabled = sync_enabled.get_untracked();
                                     selected_value.set(option_value);
                                     is_busy.set(true);
                                     local_error.set(String::new());
 
                                     spawn_local(async move {
-                                        match interop::set_feature(&monitor_id, &control_code, option_value).await {
-                                            Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                        match apply_feature_write(
+                                            monitors,
+                                            &monitor_id,
+                                            &control_code,
+                                            option_value,
+                                            sync_enabled,
+                                        ).await {
+                                            Ok(()) => {}
                                             Err(error) => local_error.set(format!("{control_label}: {error}")),
                                         }
 
@@ -1815,25 +2125,42 @@ fn PowerModeSlider(
     is_busy: RwSignal<bool>,
     local_error: RwSignal<String>,
 ) -> impl IntoView {
+    let sync_enabled = expect_context::<SyncControlsState>().enabled;
     let options = control.options.clone();
     let label = control.label.clone();
     let label_for_header = label.clone();
-    let label_for_group = label.clone();
     let label_for_modal = label.clone();
     let label_for_warning = label.clone();
     let control_supported = control.supported && !options.is_empty();
     let control_error = control.error.clone();
     let monitor_id_apply = monitor_id.clone();
     let monitor_id_confirm = StoredValue::new(monitor_id.clone());
+    let monitor_id_actions = StoredValue::new(monitor_id.clone());
     let control_code = control.code.clone();
     let control_code_apply = control_code.clone();
     let control_code_confirm = StoredValue::new(control.code.clone());
+    let control_code_actions = StoredValue::new(control.code.clone());
     let power_label_apply = label.clone();
     let power_label_confirm = StoredValue::new(label.clone());
+    let power_label_actions = StoredValue::new(label.clone());
     let selected_value = RwSignal::new(control.current_value);
     let options_for_value = StoredValue::new(options.clone());
+    let sleep_options: Vec<_> = options
+        .iter()
+        .filter(|option| matches!(option.value, 0x02 | 0x03))
+        .cloned()
+        .collect();
+    let hard_off_options: Vec<_> = options
+        .iter()
+        .filter(|option| matches!(option.value, 0x04 | 0x05))
+        .cloned()
+        .collect();
+    let sleep_options_for_each = StoredValue::new(sleep_options);
+    let hard_off_options_for_each = StoredValue::new(hard_off_options);
     let show_power_confirm = RwSignal::new(false);
     let pending_power_value = RwSignal::new(None::<u16>);
+    let sleep_target = RwSignal::new(preferred_sleep_value(&options, control.current_value));
+    let advanced_open = RwSignal::new(false);
 
     view! {
         <section class="action-row toggle-row power-row">
@@ -1845,79 +2172,199 @@ fn PowerModeSlider(
                             match selected_value.get() {
                                 Some(value) => {
                                     if value == 0x01 {
-                                        String::new()
+                                        String::from("Display active")
                                     } else {
                                         option_label(&options_for_value.get_value(), value)
                                     }
                                 }
-                                None => String::new(),
+                                None => String::from("Unavailable"),
                             }
                         }}
                     </strong>
                 </div>
             </div>
 
-            <div class="choice-strip preset-choice-strip" aria-label=label_for_group.clone() role="group">
-                <For
-                    each=move || options.clone()
-                    key=|option| option.value
-                    children=move |option| {
-                        let option_value = option.value;
-                        let option_label = option.label.clone();
-                        let monitor_id = monitor_id_apply.clone();
-                        let control_code = control_code_apply.clone();
-                        let control_label = power_label_apply.clone();
-
-                        view! {
-                            <button
-                                class=move || {
-                                    if selected_value.get() == Some(option_value) {
-                                        "choice-segment active"
-                                    } else {
-                                        "choice-segment"
-                                    }
-                                }
-                                type="button"
-                                disabled=move || !control_supported || is_busy.get()
-                                on:click=move |_| {
-                                    if selected_value.get_untracked() == Some(option_value) {
-                                        return;
-                                    }
-
-                                    if power_mode_requires_confirmation(option_value) {
-                                        pending_power_value.set(Some(option_value));
-                                        show_power_confirm.set(true);
-                                        return;
-                                    }
-
-                                    let previous_value = selected_value.get_untracked();
-                                    selected_value.set(Some(option_value));
-                                    is_busy.set(true);
-                                    local_error.set(String::new());
-
-                                    let monitor_id = monitor_id.clone();
-                                    let control_code = control_code.clone();
-                                    let control_label = control_label.clone();
-
-                                    spawn_local(async move {
-                                        match interop::set_feature(&monitor_id, &control_code, option_value).await {
-                                            Ok(updated) => replace_monitor_snapshot(monitors, updated),
-                                            Err(error) => {
-                                                selected_value.set(previous_value);
-                                                local_error.set(format!("{control_label}: {error}"));
-                                            }
-                                        }
-
-                                        is_busy.set(false);
-                                    });
-                                }
-                            >
-                                {option_label}
-                            </button>
-                        }
+            <button
+                class=move || {
+                    if selected_value.get() == Some(0x01) {
+                        "switch-control on"
+                    } else {
+                        "switch-control"
                     }
-                />
-            </div>
+                }
+                type="button"
+                disabled=move || !control_supported || is_busy.get()
+                on:click=move |_| {
+                    let next_value = if selected_value.get_untracked() == Some(0x01) {
+                        sleep_target.get_untracked()
+                    } else {
+                        0x01
+                    };
+
+                    if selected_value.get_untracked() == Some(next_value) {
+                        return;
+                    }
+
+                    let previous_value = selected_value.get_untracked();
+                    selected_value.set(Some(next_value));
+                    is_busy.set(true);
+                    local_error.set(String::new());
+
+                    let monitor_id = monitor_id_apply.clone();
+                    let control_code = control_code_apply.clone();
+                    let control_label = power_label_apply.clone();
+                    let sync_enabled = sync_enabled.get_untracked();
+
+                    spawn_local(async move {
+                        match apply_feature_write(
+                            monitors,
+                            &monitor_id,
+                            &control_code,
+                            next_value,
+                            sync_enabled,
+                        ).await {
+                            Ok(()) => {}
+                            Err(error) => {
+                                selected_value.set(previous_value);
+                                local_error.set(format!("{control_label}: {error}"));
+                            }
+                        }
+
+                        is_busy.set(false);
+                    });
+                }
+            >
+                <span class="switch-track">
+                    <span class="switch-thumb"></span>
+                </span>
+                <span class="switch-copy">
+                    {move || {
+                        if selected_value.get() == Some(0x01) {
+                            String::from("On")
+                        } else {
+                            String::from("Sleep")
+                        }
+                    }}
+                </span>
+            </button>
+
+            <details
+                class="surface-fold power-advanced"
+                prop:open=move || advanced_open.get()
+                on:toggle=move |event: Event| {
+                    advanced_open.set(event_target::<HtmlDetailsElement>(&event).open());
+                }
+            >
+                <summary class="surface-fold-summary power-advanced-summary">
+                    <div>
+                        <p class="panel-label">"Advanced Power"</p>
+                        <strong class="panel-value surface-fold-value">
+                            {move || option_label(&options_for_value.get_value(), sleep_target.get())}
+                        </strong>
+                    </div>
+                </summary>
+
+                <div class="surface-fold-body power-advanced-body">
+                    <div class="power-advanced-group">
+                        <p class="panel-label">"Sleep"</p>
+                        <div class="choice-strip preset-choice-strip" role="group" aria-label="Sleep mode">
+                            <For
+                                each=move || sleep_options_for_each.get_value()
+                                key=|option| option.value
+                                children=move |option| {
+                                    let option_value = option.value;
+                                    let option_label = option.label.clone();
+
+                                    view! {
+                                        <button
+                                            class=move || {
+                                                if sleep_target.get() == option_value {
+                                                    "choice-segment active"
+                                                } else {
+                                                    "choice-segment"
+                                                }
+                                            }
+                                            type="button"
+                                            disabled=move || !control_supported || is_busy.get()
+                                            on:click=move |_| {
+                                                sleep_target.set(option_value);
+
+                                                if selected_value.get_untracked() == Some(0x01) {
+                                                    return;
+                                                }
+
+                                                if selected_value.get_untracked() == Some(option_value) {
+                                                    return;
+                                                }
+
+                                                let previous_value = selected_value.get_untracked();
+                                                selected_value.set(Some(option_value));
+                                                is_busy.set(true);
+                                                local_error.set(String::new());
+
+                                                let monitor_id = monitor_id_actions.get_value();
+                                                let control_code = control_code_actions.get_value();
+                                                let control_label = power_label_actions.get_value();
+                                                let sync_enabled = sync_enabled.get_untracked();
+
+                                                spawn_local(async move {
+                                                    match apply_feature_write(
+                                                        monitors,
+                                                        &monitor_id,
+                                                        &control_code,
+                                                        option_value,
+                                                        sync_enabled,
+                                                    ).await {
+                                                        Ok(()) => {}
+                                                        Err(error) => {
+                                                            selected_value.set(previous_value);
+                                                            local_error.set(format!("{control_label}: {error}"));
+                                                        }
+                                                    }
+
+                                                    is_busy.set(false);
+                                                });
+                                            }
+                                        >
+                                            {option_label}
+                                        </button>
+                                    }
+                                }
+                            />
+                        </div>
+                    </div>
+
+                    <Show when=move || !hard_off_options_for_each.get_value().is_empty()>
+                        <div class="power-advanced-group">
+                            <p class="panel-label">"Hard Off"</p>
+                            <div class="choice-strip preset-choice-strip" role="group" aria-label="Hard off">
+                                <For
+                                    each=move || hard_off_options_for_each.get_value()
+                                    key=|option| option.value
+                                    children=move |option| {
+                                        let option_value = option.value;
+                                        let option_label = option.label.clone();
+
+                                        view! {
+                                            <button
+                                                class="choice-segment"
+                                                type="button"
+                                                disabled=move || !control_supported || is_busy.get()
+                                                on:click=move |_| {
+                                                    pending_power_value.set(Some(option_value));
+                                                    show_power_confirm.set(true);
+                                                }
+                                            >
+                                                {option_label}
+                                            </button>
+                                        }
+                                    }
+                                />
+                            </div>
+                        </div>
+                    </Show>
+                </div>
+            </details>
 
             <Show when=move || show_power_confirm.get()>
                 <div class="modal-overlay" on:click=move |_| show_power_confirm.set(false)>
@@ -1966,10 +2413,17 @@ fn PowerModeSlider(
                                     let monitor_id = monitor_id_confirm.get_value();
                                     let control_code = control_code_confirm.get_value();
                                     let control_label = power_label_confirm.get_value();
+                                    let sync_enabled = sync_enabled.get_untracked();
 
                                     spawn_local(async move {
-                                        match interop::set_feature(&monitor_id, &control_code, target_value).await {
-                                            Ok(updated) => replace_monitor_snapshot(monitors, updated),
+                                        match apply_feature_write(
+                                            monitors,
+                                            &monitor_id,
+                                            &control_code,
+                                            target_value,
+                                            sync_enabled,
+                                        ).await {
+                                            Ok(()) => {}
                                             Err(error) => {
                                                 selected_value.set(previous_value);
                                                 local_error.set(format!("{control_label}: {error}"));
@@ -1998,8 +2452,370 @@ fn PowerModeSlider(
     }
 }
 
-fn power_mode_requires_confirmation(value: u16) -> bool {
-    matches!(value, 0x04 | 0x05)
+fn preferred_sleep_value(options: &[ControlOption], current_value: Option<u16>) -> u16 {
+    if let Some(current_value) = current_value
+        && current_value == 0x03
+    {
+        return current_value;
+    }
+
+    if options.iter().any(|option| option.value == 0x03) {
+        return 0x03;
+    }
+
+    options
+        .iter()
+        .find(|option| matches!(option.value, 0x02 | 0x03))
+        .map(|option| option.value)
+        .unwrap_or(0x02)
+}
+
+async fn apply_feature_write(
+    monitors: RwSignal<Vec<MonitorSnapshot>>,
+    monitor_id: &str,
+    control_code: &str,
+    value: u16,
+    sync_enabled: bool,
+) -> Result<(), String> {
+    let known_monitors = monitors.get_untracked();
+    let targets = feature_target_ids(&known_monitors, monitor_id, control_code, value, sync_enabled);
+    if targets.is_empty() {
+        return Err(String::from("No compatible displays available for sync."));
+    }
+
+    let control_code = control_code.to_string();
+    let results = wait_for_parallel_tasks(targets.into_iter().map(|(target_id, target_label)| {
+        let control_code = control_code.clone();
+        let target_value =
+            synced_feature_value(&known_monitors, monitor_id, &target_id, &control_code, value);
+        async move {
+            (
+                target_label,
+                interop::set_feature(&target_id, &control_code, target_value).await,
+            )
+        }
+    }))
+    .await;
+
+    let mut failures = Vec::new();
+    for (target_label, result) in results {
+        match result {
+            Ok(updated) => replace_monitor_snapshot(monitors, updated),
+            Err(error) => failures.push(format!("{target_label}: {error}")),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join(" | "))
+    }
+}
+
+async fn apply_transition_write(
+    monitors: RwSignal<Vec<MonitorSnapshot>>,
+    monitor_id: &str,
+    control_code: &str,
+    value: u16,
+    step_delay_ms: u64,
+    sync_enabled: bool,
+) -> Result<(), String> {
+    let known_monitors = monitors.get_untracked();
+    let targets = feature_target_ids(&known_monitors, monitor_id, control_code, value, sync_enabled);
+    if targets.is_empty() {
+        return Err(String::from("No compatible displays available for sync."));
+    }
+
+    let control_code = control_code.to_string();
+    let results = wait_for_parallel_tasks(targets.into_iter().map(|(target_id, target_label)| {
+        let control_code = control_code.clone();
+        let target_value =
+            synced_feature_value(&known_monitors, monitor_id, &target_id, &control_code, value);
+        async move {
+            let result = if step_delay_ms == 0 {
+                interop::set_feature(&target_id, &control_code, target_value).await
+            } else {
+                interop::transition_feature(&target_id, &control_code, target_value, step_delay_ms)
+                    .await
+            };
+            (target_label, result)
+        }
+    }))
+    .await;
+
+    let mut failures = Vec::new();
+    for (target_label, result) in results {
+        match result {
+            Ok(updated) => replace_monitor_snapshot(monitors, updated),
+            Err(error) => failures.push(format!("{target_label}: {error}")),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join(" | "))
+    }
+}
+
+async fn apply_color_scene_write(
+    monitors: RwSignal<Vec<MonitorSnapshot>>,
+    monitor_id: &str,
+    scene_id: &str,
+    sync_enabled: bool,
+) -> Result<(), String> {
+    let known_monitors = monitors.get_untracked();
+    let targets = color_scene_target_ids(&known_monitors, monitor_id, sync_enabled);
+    if targets.is_empty() {
+        return Err(String::from("No compatible displays available for sync."));
+    }
+
+    let scene_id = scene_id.to_string();
+    let results = wait_for_parallel_tasks(targets.into_iter().map(|(target_id, target_label)| {
+        let scene_id = scene_id.clone();
+        async move {
+            (
+                target_label,
+                interop::apply_color_scene(&target_id, &scene_id).await,
+            )
+        }
+    }))
+    .await;
+
+    let mut failures = Vec::new();
+    for (target_label, result) in results {
+        match result {
+            Ok(updated) => replace_monitor_snapshot(monitors, updated),
+            Err(error) => failures.push(format!("{target_label}: {error}")),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join(" | "))
+    }
+}
+
+fn feature_target_ids(
+    monitors: &[MonitorSnapshot],
+    monitor_id: &str,
+    control_code: &str,
+    value: u16,
+    sync_enabled: bool,
+) -> Vec<(String, String)> {
+    if !sync_enabled {
+        return vec![(monitor_id.to_string(), monitor_target_label(monitors, monitor_id))];
+    }
+
+    let mut targets = Vec::new();
+    for monitor in monitors {
+        if let Some(control) = monitor.controls.iter().find(|control| control.code == control_code)
+            && control_accepts_value(control, value)
+        {
+            targets.push((monitor.id.clone(), monitor.label()));
+        }
+    }
+
+    if targets.is_empty() {
+        vec![(monitor_id.to_string(), monitor_target_label(monitors, monitor_id))]
+    } else {
+        targets
+    }
+}
+
+fn synced_feature_value(
+    monitors: &[MonitorSnapshot],
+    source_monitor_id: &str,
+    target_monitor_id: &str,
+    control_code: &str,
+    source_value: u16,
+) -> u16 {
+    let Some(source_monitor) = monitors.iter().find(|monitor| monitor.id == source_monitor_id) else {
+        return source_value;
+    };
+    let Some(target_monitor) = monitors.iter().find(|monitor| monitor.id == target_monitor_id) else {
+        return source_value;
+    };
+    let Some(source_control) = source_monitor
+        .controls
+        .iter()
+        .find(|control| control.code == control_code)
+    else {
+        return source_value;
+    };
+    let Some(target_control) = target_monitor
+        .controls
+        .iter()
+        .find(|control| control.code == control_code)
+    else {
+        return source_value;
+    };
+
+    if source_control.control_type != shared::MonitorControlType::Range
+        || target_control.control_type != shared::MonitorControlType::Range
+    {
+        return source_value;
+    }
+
+    let Some(source_max) = source_control.max_value.filter(|max| *max > 0) else {
+        return source_value;
+    };
+    let Some(target_max) = target_control.max_value.filter(|max| *max > 0) else {
+        return source_value;
+    };
+
+    let scaled = ((u32::from(source_value.min(source_max)) * u32::from(target_max))
+        + (u32::from(source_max) / 2))
+        / u32::from(source_max);
+    scaled.min(u32::from(target_max)) as u16
+}
+
+fn color_scene_target_ids(
+    monitors: &[MonitorSnapshot],
+    monitor_id: &str,
+    sync_enabled: bool,
+) -> Vec<(String, String)> {
+    if !sync_enabled {
+        return vec![(monitor_id.to_string(), monitor_target_label(monitors, monitor_id))];
+    }
+
+    let mut targets = Vec::new();
+    for monitor in monitors {
+        if monitor_supports_color_scene(monitor) {
+            targets.push((monitor.id.clone(), monitor.label()));
+        }
+    }
+
+    if targets.is_empty() {
+        vec![(monitor_id.to_string(), monitor_target_label(monitors, monitor_id))]
+    } else {
+        targets
+    }
+}
+
+fn monitor_target_label(monitors: &[MonitorSnapshot], monitor_id: &str) -> String {
+    monitors
+        .iter()
+        .find(|monitor| monitor.id == monitor_id)
+        .map(MonitorSnapshot::label)
+        .unwrap_or_else(|| monitor_id.to_string())
+}
+
+fn control_accepts_value(control: &MonitorControl, value: u16) -> bool {
+    if !control.supported {
+        return false;
+    }
+
+    match control.control_type {
+        shared::MonitorControlType::Range => control.max_value.map(|max| value <= max).unwrap_or(true),
+        _ if control.options.is_empty() => true,
+        _ => control.options.iter().any(|option| option.value == value),
+    }
+}
+
+fn monitor_supports_color_scene(monitor: &MonitorSnapshot) -> bool {
+    ["16", "18", "1A"].into_iter().all(|code| {
+        monitor
+            .controls
+            .iter()
+            .any(|control| control.code == code && control.supported)
+    })
+}
+
+fn load_theme_mode() -> ThemeMode {
+    window()
+        .and_then(local_storage_value)
+        .and_then(|value| ThemeMode::from_attr(&value))
+        .unwrap_or(ThemeMode::System)
+}
+
+fn save_theme_mode(theme: ThemeMode) {
+    if let Some(window) = window() {
+        set_local_storage_value(&window, THEME_STORAGE_KEY, theme.attr());
+    }
+}
+
+fn local_storage_value(window: web_sys::Window) -> Option<String> {
+    let storage = js_sys::Reflect::get(&window, &JsValue::from_str("localStorage")).ok()?;
+    if storage.is_null() || storage.is_undefined() {
+        return None;
+    }
+
+    let get_item = js_sys::Reflect::get(&storage, &JsValue::from_str("getItem"))
+        .ok()?
+        .dyn_into::<js_sys::Function>()
+        .ok()?;
+    get_item
+        .call1(&storage, &JsValue::from_str(THEME_STORAGE_KEY))
+        .ok()?
+        .as_string()
+}
+
+fn set_local_storage_value(window: &web_sys::Window, key: &str, value: &str) {
+    let Ok(storage) = js_sys::Reflect::get(window, &JsValue::from_str("localStorage")) else {
+        return;
+    };
+    if storage.is_null() || storage.is_undefined() {
+        return;
+    }
+
+    let Ok(set_item) = js_sys::Reflect::get(&storage, &JsValue::from_str("setItem")) else {
+        return;
+    };
+    let Ok(set_item) = set_item.dyn_into::<js_sys::Function>() else {
+        return;
+    };
+    let _ = set_item.call2(
+        &storage,
+        &JsValue::from_str(key),
+        &JsValue::from_str(value),
+    );
+}
+
+fn binary_toggle_config(options: &[ControlOption]) -> Option<BinaryToggleConfig> {
+    if options.len() != 2 {
+        return None;
+    }
+
+    let classify = |label: &str| {
+        let lower = label.to_ascii_lowercase();
+        if lower.contains("enabled")
+            || lower.contains("unmuted")
+            || lower == "on"
+            || lower.ends_with(" on")
+        {
+            Some(true)
+        } else if lower.contains("disabled")
+            || lower.contains("muted")
+            || lower == "off"
+            || lower.ends_with(" off")
+        {
+            Some(false)
+        } else {
+            None
+        }
+    };
+
+    let first_is_on = classify(&options[0].label)?;
+    let second_is_on = classify(&options[1].label)?;
+
+    if first_is_on == second_is_on {
+        return None;
+    }
+
+    let (on_option, off_option) = if first_is_on {
+        (&options[0], &options[1])
+    } else {
+        (&options[1], &options[0])
+    };
+
+    Some(BinaryToggleConfig {
+        on_value: on_option.value,
+        on_label: on_option.label.clone(),
+        off_value: off_option.value,
+        off_label: off_option.label.clone(),
+    })
 }
 
 fn glide_label(delay_ms: u16) -> String {
@@ -2115,10 +2931,68 @@ fn monitor_transport_label(monitor: &MonitorSnapshot) -> Option<String> {
         .map(|path| format!("dev:{path}"))
 }
 
+struct ParallelTaskState<T> {
+    remaining: usize,
+    results: Vec<Option<T>>,
+    waker: Option<Waker>,
+}
+
+async fn wait_for_parallel_tasks<I, Fut, T>(tasks: I) -> Vec<T>
+where
+    I: IntoIterator<Item = Fut>,
+    Fut: Future<Output = T> + 'static,
+    T: 'static,
+{
+    let tasks: Vec<Fut> = tasks.into_iter().collect();
+    let len = tasks.len();
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let state = Rc::new(RefCell::new(ParallelTaskState {
+        remaining: len,
+        results: std::iter::repeat_with(|| None).take(len).collect(),
+        waker: None,
+    }));
+
+    for (index, task) in tasks.into_iter().enumerate() {
+        let state = state.clone();
+        spawn_local(async move {
+            let output = task.await;
+            let mut state = state.borrow_mut();
+            state.results[index] = Some(output);
+            state.remaining = state.remaining.saturating_sub(1);
+            if state.remaining == 0
+                && let Some(waker) = state.waker.take()
+            {
+                waker.wake();
+            }
+        });
+    }
+
+    poll_fn(move |cx| {
+        let mut state = state.borrow_mut();
+        if state.remaining == 0 {
+            let results = state
+                .results
+                .drain(..)
+                .map(|result| result.expect("parallel task missing result"))
+                .collect();
+            Poll::Ready(results)
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 fn queue_range_change(ctx: RangeChangeContext, parsed: u16) {
     ctx.slider_value.set(parsed);
     ctx.pending_value.set(Some(parsed));
     ctx.local_error.set(String::new());
+    set_range_override(ctx.range_overrides, &ctx.monitor_id, &ctx.control_code, parsed);
+    update_monitor_control_value(ctx.monitors, &ctx.monitor_id, &ctx.control_code, parsed);
 
     if !ctx.in_flight.get_untracked() {
         drive_range_change(ctx);
@@ -2134,21 +3008,25 @@ fn drive_range_change(ctx: RangeChangeContext) {
     ctx.in_flight.set(true);
 
     spawn_local(async move {
-        let result = if ctx.delay == 0 {
-            interop::set_feature(&ctx.monitor_id, &ctx.control_code, target).await
-        } else {
-            interop::transition_feature(&ctx.monitor_id, &ctx.control_code, target, ctx.delay).await
-        };
+        let result = apply_transition_write(
+            ctx.monitors,
+            &ctx.monitor_id,
+            &ctx.control_code,
+            target,
+            ctx.delay,
+            ctx.sync_enabled.get_untracked(),
+        ).await;
 
         match result {
-            Ok(updated) => {
+            Ok(()) => {
                 if ctx.pending_value.get_untracked().is_none() {
-                    replace_monitor_snapshot(ctx.monitors, updated);
+                    clear_range_override(ctx.range_overrides, &ctx.monitor_id, &ctx.control_code);
                 }
             }
-            Err(error) => ctx
-                .local_error
-                .set(format!("{}: {error}", ctx.control_label)),
+            Err(error) => {
+                clear_range_override(ctx.range_overrides, &ctx.monitor_id, &ctx.control_code);
+                ctx.local_error.set(format!("{}: {error}", ctx.control_label));
+            }
         }
 
         ctx.in_flight.set(false);
@@ -2156,6 +3034,73 @@ fn drive_range_change(ctx: RangeChangeContext) {
         if ctx.pending_value.get_untracked().is_some() {
             drive_range_change(ctx);
         }
+    });
+}
+
+fn range_override_key(monitor_id: &str, control_code: &str) -> String {
+    format!("{monitor_id}:{control_code}")
+}
+
+fn range_override_value(
+    overrides: RwSignal<HashMap<String, u16>>,
+    monitor_id: &str,
+    control_code: &str,
+) -> Option<u16> {
+    overrides
+        .get()
+        .get(&range_override_key(monitor_id, control_code))
+        .copied()
+}
+
+fn range_override_value_untracked(
+    overrides: RwSignal<HashMap<String, u16>>,
+    monitor_id: &str,
+    control_code: &str,
+) -> Option<u16> {
+    overrides
+        .get_untracked()
+        .get(&range_override_key(monitor_id, control_code))
+        .copied()
+}
+
+fn set_range_override(
+    overrides: RwSignal<HashMap<String, u16>>,
+    monitor_id: &str,
+    control_code: &str,
+    value: u16,
+) {
+    let key = range_override_key(monitor_id, control_code);
+    overrides.update(|all| {
+        all.insert(key, value);
+    });
+}
+
+fn update_monitor_control_value(
+    monitors: RwSignal<Vec<MonitorSnapshot>>,
+    monitor_id: &str,
+    control_code: &str,
+    value: u16,
+) {
+    monitors.update(|all| {
+        if let Some(monitor) = all.iter_mut().find(|monitor| monitor.id == monitor_id)
+            && let Some(control) = monitor
+                .controls
+                .iter_mut()
+                .find(|control| control.code == control_code)
+        {
+            control.current_value = Some(value);
+        }
+    });
+}
+
+fn clear_range_override(
+    overrides: RwSignal<HashMap<String, u16>>,
+    monitor_id: &str,
+    control_code: &str,
+) {
+    let key = range_override_key(monitor_id, control_code);
+    overrides.update(|all| {
+        all.remove(&key);
     });
 }
 

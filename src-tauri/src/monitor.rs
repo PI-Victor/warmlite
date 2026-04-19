@@ -58,11 +58,6 @@ mod imp {
 
     const FEATURE_DEFINITIONS: &[FeatureDefinition] = &[
         FeatureDefinition {
-            code: "02",
-            label: "New Control Value",
-            kind: FeatureKind::Choice,
-        },
-        FeatureDefinition {
             code: "10",
             label: "Brightness",
             kind: FeatureKind::Range,
@@ -96,11 +91,6 @@ mod imp {
             code: "1A",
             label: "Blue Gain",
             kind: FeatureKind::Range,
-        },
-        FeatureDefinition {
-            code: "DC",
-            label: "Display Mode",
-            kind: FeatureKind::Choice,
         },
         FeatureDefinition {
             code: "8D",
@@ -137,11 +127,6 @@ mod imp {
             label: "Restore Color Defaults",
             kind: FeatureKind::Action,
         },
-        FeatureDefinition {
-            code: "B0",
-            label: "Stored Settings",
-            kind: FeatureKind::Action,
-        },
     ];
     const RANGE_TARGET_STEP_SIZE: u16 = 2;
     const RANGE_MAX_TRANSITION_WRITES: u16 = 24;
@@ -174,7 +159,7 @@ mod imp {
             }
         }
         set_feature_value(&monitor, code, value)?;
-        if matches!(normalized_code.as_str(), "14" | "04" | "05" | "08" | "B0") {
+        if matches!(normalized_code.as_str(), "14" | "04" | "05" | "08") {
             thread::sleep(Duration::from_millis(220));
         }
         Ok(snapshot_for_monitor(&monitor))
@@ -599,16 +584,6 @@ mod imp {
         }
 
         match definition.code {
-            "02" => vec![
-                ControlOption {
-                    value: 0x01,
-                    label: String::from("No changes"),
-                },
-                ControlOption {
-                    value: 0x02,
-                    label: String::from("Some values changed"),
-                },
-            ],
             "8D" => vec![
                 ControlOption {
                     value: 0x02,
@@ -693,16 +668,6 @@ mod imp {
                 value: 0x01,
                 label: String::from("Restore Color Defaults"),
             }],
-            "B0" => vec![
-                ControlOption {
-                    value: 0x01,
-                    label: String::from("Store Current Settings"),
-                },
-                ControlOption {
-                    value: 0x02,
-                    label: String::from("Restore Current Mode"),
-                },
-            ],
             _ => Vec::new(),
         }
     }
@@ -1124,11 +1089,6 @@ mod imp {
 
     const DDC_FEATURE_DEFINITIONS: &[DdcFeatureDefinition] = &[
         DdcFeatureDefinition {
-            code: "02",
-            label: "New Control Value",
-            kind: DdcFeatureKind::Choice,
-        },
-        DdcFeatureDefinition {
             code: "10",
             label: "Brightness",
             kind: DdcFeatureKind::Range,
@@ -1164,11 +1124,6 @@ mod imp {
             kind: DdcFeatureKind::Range,
         },
         DdcFeatureDefinition {
-            code: "DC",
-            label: "Display Mode",
-            kind: DdcFeatureKind::Choice,
-        },
-        DdcFeatureDefinition {
             code: "8D",
             label: "Mute",
             kind: DdcFeatureKind::Toggle,
@@ -1201,11 +1156,6 @@ mod imp {
         DdcFeatureDefinition {
             code: "08",
             label: "Restore Color Defaults",
-            kind: DdcFeatureKind::Action,
-        },
-        DdcFeatureDefinition {
-            code: "B0",
-            label: "Stored Settings",
             kind: DdcFeatureKind::Action,
         },
     ];
@@ -2856,16 +2806,6 @@ mod imp {
 
     fn ddc_feature_options(code: &str, kind: DdcFeatureKind) -> Vec<shared::ControlOption> {
         match code {
-            "02" => vec![
-                shared::ControlOption {
-                    value: 0x01,
-                    label: String::from("No changes"),
-                },
-                shared::ControlOption {
-                    value: 0x02,
-                    label: String::from("Some values changed"),
-                },
-            ],
             "8D" => vec![
                 shared::ControlOption {
                     value: 0x02,
@@ -2982,25 +2922,7 @@ mod imp {
                     label: String::from("Italian"),
                 },
             ],
-            "DC" => vec![
-                shared::ControlOption {
-                    value: 0x01,
-                    label: String::from("Standard"),
-                },
-                shared::ControlOption {
-                    value: 0x02,
-                    label: String::from("Movie"),
-                },
-                shared::ControlOption {
-                    value: 0x03,
-                    label: String::from("Game"),
-                },
-                shared::ControlOption {
-                    value: 0x04,
-                    label: String::from("Dynamic"),
-                },
-            ],
-            "04" | "05" | "08" | "B0" if matches!(kind, DdcFeatureKind::Action) => {
+            "04" | "05" | "08" if matches!(kind, DdcFeatureKind::Action) => {
                 vec![shared::ControlOption {
                     value: 0x01,
                     label: String::from("Apply"),

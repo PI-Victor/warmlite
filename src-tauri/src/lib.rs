@@ -13,7 +13,8 @@ pub fn run() {
             commands::list_monitors,
             commands::set_monitor_feature,
             commands::transition_monitor_feature,
-            commands::apply_color_scene
+            commands::apply_color_scene,
+            commands::quit_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running WarmLite");

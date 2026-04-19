@@ -85,6 +85,10 @@ pub async fn apply_color_scene(
     .await
 }
 
+pub async fn quit_app() -> Result<(), String> {
+    invoke::<(), _>("quit_app", ()).await
+}
+
 async fn invoke<T, A>(command: &str, args: A) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned,

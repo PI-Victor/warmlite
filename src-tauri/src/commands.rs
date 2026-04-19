@@ -49,3 +49,8 @@ pub async fn apply_color_scene(
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
 }
+
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
